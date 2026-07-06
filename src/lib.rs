@@ -154,6 +154,53 @@ fn git_facade(
     )
 }
 
+/// A `gh`-backed read facade over a pull request: `gh <sub…> <pr> [--repo R]`,
+/// run in `dir` (or against `--repo owner/name`). `pr=` is required.
+fn gh_pr_facade(
+    id: &'static str,
+    title: &'static str,
+    summary: &'static str,
+    sub: &'static [&'static str],
+) -> FnEndpoint {
+    FnEndpoint::new(id, move |inv: &Invocation<'_>| {
+        let pr = inv
+            .inline_str("pr")
+            .map_err(|_| Error::MissingArgument("pr (the pull-request number)".to_string()))?;
+        let mut args: Vec<String> = sub.iter().map(|a| a.to_string()).collect();
+        args.push(pr.to_string());
+        if let Ok(repo) = inv.inline_str("repo") {
+            args.push("--repo".to_string());
+            args.push(repo.to_string());
+        }
+        let dir = inv.inline_str("dir").ok();
+        run(inv, "gh", &args, dir).map(text)
+    })
+    .with_description(
+        Description::new(id)
+            .title(title)
+            .summary(summary)
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .requires("urn:cap:exec:gh")
+            .input(
+                ArgSpec::new("pr")
+                    .class("http://www.w3.org/2001/XMLSchema#integer")
+                    .summary("the pull-request number"),
+            )
+            .input(
+                ArgSpec::new("repo")
+                    .summary("owner/name (else the repo at dir=/cwd)")
+                    .optional(),
+            )
+            .input(
+                ArgSpec::new("dir")
+                    .summary("a repo directory to run in (else the process cwd)")
+                    .optional(),
+            )
+            .output("text/plain;charset=utf-8"),
+    )
+}
+
 /// The dev-tooling space: the exec seam + the read facades.
 pub fn space() -> EndpointSpace {
     EndpointSpace::new()
@@ -183,6 +230,26 @@ pub fn space() -> EndpointSpace {
                 "Current branch",
                 "The current branch name (git branch --show-current).",
                 &["branch", "--show-current"],
+            ),
+        )
+        .bind(
+            Exact::new("urn:repo:pr:checks"),
+            gh_pr_facade(
+                "repo-pr-checks",
+                "PR check status",
+                "The CI check runs for a pull request and their state (gh pr checks). A \
+                 SNAPSHOT — for a blocking wait use gh's own --watch; the standing poll job \
+                 (host-side, time transport) is what removes the wait from an agent's loop.",
+                &["pr", "checks"],
+            ),
+        )
+        .bind(
+            Exact::new("urn:repo:pr:view"),
+            gh_pr_facade(
+                "repo-pr-view",
+                "PR overview",
+                "A pull request's title, state, and metadata (gh pr view).",
+                &["pr", "view"],
             ),
         )
 }
@@ -240,6 +307,19 @@ mod tests {
             "{:?}",
             String::from_utf8_lossy(&out.bytes)
         );
+    }
+
+    #[test]
+    fn gh_facade_is_gated_and_requires_pr() {
+        // No exec:gh grant → denied before any gh runs.
+        let bare = Capability::scoped(["urn:cap:exec:git"]);
+        let err = source("urn:repo:pr:checks", &[("pr", "1")], &bare).unwrap_err();
+        assert!(format!("{err:?}").contains("does not grant"), "{err:?}");
+
+        // With the grant but no pr= → a clean missing-argument error (still no gh run).
+        let gh = Capability::scoped(["urn:cap:exec:gh"]);
+        let err = source("urn:repo:pr:checks", &[], &gh).unwrap_err();
+        assert!(format!("{err:?}").contains("MissingArgument"), "{err:?}");
     }
 
     #[test]
