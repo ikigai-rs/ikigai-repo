@@ -1,7 +1,7 @@
 //! ikigai reading its own git state through the manifold.
 //!
 //!   cargo run --example repo-demo
-use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
+use ikigai_core::{Capability, Iri, Kernel, Request, Verb};
 use std::sync::Arc;
 
 fn main() {
