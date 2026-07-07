@@ -46,8 +46,9 @@ const ALLOWED_TOOLS: &[&str] = &["git", "gh", "cargo", "just"];
 const FS_READ: &str = "urn:cap:fs:read:*";
 
 /// Run an allowlisted tool with an argument vector in `dir`, capability-gated.
-/// Returns its stdout on success (exit 0); a non-zero exit or a spawn failure is
-/// an [`Error::Endpoint`] carrying stderr — so a caller sees *why*, as data.
+/// Returns its stdout on success (exit 0); a missing capability is a typed,
+/// permanent [`Error::Denied`], while a non-zero exit or a spawn failure is an
+/// [`Error::Endpoint`] carrying stderr — so a caller sees *why*, as data.
 fn run(inv: &Invocation<'_>, tool: &str, args: &[String], dir: Option<&str>) -> Result<String> {
     if !ALLOWED_TOOLS.contains(&tool) {
         return Err(Error::Endpoint(format!(
@@ -57,7 +58,9 @@ fn run(inv: &Invocation<'_>, tool: &str, args: &[String], dir: Option<&str>) -> 
     }
     let scope = format!("urn:cap:exec:{tool}");
     if !inv.capability.allows(&scope) {
-        return Err(Error::Endpoint(format!(
+        // Typed `Denied` — a permanent authority failure the trace, manifold,
+        // and wire recognize as a 403-equivalent without sniffing message text.
+        return Err(Error::Denied(format!(
             "exec: capability does not grant `{scope}`"
         )));
     }
@@ -244,7 +247,9 @@ fn repo_root(inv: &Invocation<'_>) -> Result<PathBuf> {
 fn list() -> FnEndpoint {
     FnEndpoint::new("repo-list", |inv: &Invocation<'_>| {
         if !inv.capability.allows(FS_READ) {
-            return Err(Error::Endpoint(format!(
+            // Typed `Denied` — a permanent authority failure the trace, manifold,
+            // and wire recognize as a 403-equivalent without sniffing message text.
+            return Err(Error::Denied(format!(
                 "repo-list: capability does not grant `{FS_READ}`"
             )));
         }
@@ -381,7 +386,9 @@ mod tests {
     fn exec_is_capability_gated_and_allowlisted() {
         let git = Capability::scoped(["urn:cap:exec:git"]);
 
-        // No exec grant at all → denied.
+        // No exec grant at all → denied. A capability denial is the typed,
+        // permanent `Denied` — never a generic `Endpoint` string, and never
+        // transient (re-issuing under the same capability won't change the answer).
         let none = Capability::scoped(["urn:cap:unrelated"]);
         let err = source(
             "urn:system:exec",
@@ -389,7 +396,8 @@ mod tests {
             &none,
         )
         .unwrap_err();
-        assert!(format!("{err:?}").contains("does not grant"), "{err:?}");
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+        assert!(!err.is_transient(), "{err:?}");
 
         // A non-allowlisted tool → refused before any process, even under a matching cap.
         let evil = Capability::scoped(["urn:cap:exec:rm"]);
@@ -415,10 +423,11 @@ mod tests {
 
     #[test]
     fn gh_facade_is_gated_and_requires_pr() {
-        // No exec:gh grant → denied before any gh runs.
+        // No exec:gh grant → denied (typed, permanent) before any gh runs.
         let bare = Capability::scoped(["urn:cap:exec:git"]);
         let err = source("urn:repo:pr:checks", &[("pr", "1")], &bare).unwrap_err();
-        assert!(format!("{err:?}").contains("does not grant"), "{err:?}");
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+        assert!(!err.is_transient(), "{err:?}");
 
         // With the grant but no pr= → a clean missing-argument error (still no gh run).
         let gh = Capability::scoped(["urn:cap:exec:gh"]);
@@ -471,9 +480,11 @@ mod tests {
 
     #[test]
     fn list_is_capability_gated() {
-        // No fs:read grant → denied before any directory is read.
+        // No fs:read grant → denied before any directory is read. The typed,
+        // permanent `Denied` (a 403-equivalent), never transient.
         let none = Capability::scoped(["urn:cap:unrelated"]);
         let err = source("urn:repo:list", &[("root", "/tmp")], &none).unwrap_err();
-        assert!(format!("{err:?}").contains("does not grant"), "{err:?}");
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+        assert!(!err.is_transient(), "{err:?}");
     }
 }
