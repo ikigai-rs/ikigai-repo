@@ -5,7 +5,9 @@
 //! tool with an **argument vector** (never a shell string — nothing is ever
 //! interpolated into a shell, so there is no injection surface), and a set of
 //! **typed facades** over it (`urn:repo:status`, `:log`, `:branch`) that build
-//! the right invocation and speak the ikigai self-description.
+//! the right invocation and speak the ikigai self-description. A companion
+//! `urn:repo:list` enumerates the repositories under a ROOT so an agent whose
+//! cwd is not a repo (e.g. `ikigai mcp`) can discover where to point `dir=`.
 //!
 //! Native-only by nature (it spawns subprocesses), so it carries no wasm face —
 //! it is to the shell what `ikigai-personal` is to EventKit.
@@ -19,7 +21,12 @@
 //! `urn:system:exec` requires `urn:cap:exec:{tool}` (e.g. `urn:cap:exec:git`);
 //! the manifold offers it under the wildcard `urn:cap:exec:*`. Each facade
 //! declares the concrete capability it needs. No grant, no tool.
+//!
+//! `urn:repo:list` is a filesystem read, not an exec — it enumerates directory
+//! names, never spawning a process — so it declares and enforces
+//! `urn:cap:fs:read:*` instead of an `exec:*` scope.
 
+use std::path::PathBuf;
 use std::process::Command;
 
 use ikigai_core::{
@@ -31,6 +38,12 @@ use ikigai_core::{
 /// process is created — the allowlist is the outer bound, the capability the
 /// inner one.
 const ALLOWED_TOOLS: &[&str] = &["git", "gh", "cargo", "just"];
+
+/// Listing the repositories under a ROOT reads directory names — a filesystem
+/// read. `urn:repo:list` declares and enforces this scope (the MCP `claude`
+/// grant already holds `urn:cap:fs:read:*`). Matching is exact today, so the
+/// wildcard token is the literal grant, not a prefix rule.
+const FS_READ: &str = "urn:cap:fs:read:*";
 
 /// Run an allowlisted tool with an argument vector in `dir`, capability-gated.
 /// Returns its stdout on success (exit 0); a non-zero exit or a spawn failure is
@@ -201,6 +214,96 @@ fn gh_pr_facade(
     )
 }
 
+/// Where `urn:repo:list` scans, in priority order: an explicit `root=` arg,
+/// then the `IKIGAI_REPO_ROOT` env var (the IKIGAI_* config convention), then
+/// `~/git-personal` — this ecosystem's home for its sibling repos.
+fn repo_root(inv: &Invocation<'_>) -> Result<PathBuf> {
+    if let Ok(root) = inv.inline_str("root") {
+        return Ok(PathBuf::from(root));
+    }
+    if let Ok(root) = std::env::var("IKIGAI_REPO_ROOT") {
+        return Ok(PathBuf::from(root));
+    }
+    let home = std::env::var("HOME").map_err(|_| {
+        Error::Endpoint("repo-list: no root=, no IKIGAI_REPO_ROOT, and $HOME is unset".to_string())
+    })?;
+    Ok(PathBuf::from(home).join("git-personal"))
+}
+
+/// `urn:repo:list` — enumerate the git repositories under a ROOT, one
+/// `name<TAB>path` per line, so an agent whose cwd is *not* a repo (the `ikigai
+/// mcp` case) can discover where repos live and hand one back as `dir=` to the
+/// `urn:repo:*` facades.
+///
+/// A repo is an immediate child directory of ROOT that holds a `.git` entry.
+/// One level deep is enough for this flat ecosystem (the repos are siblings
+/// under `~/git-personal`); we deliberately do NOT recurse. Listing directory
+/// names is a filesystem read — this crate is native-only by design, so it
+/// reads the directory with `std::fs` directly rather than through a kernel fs
+/// mount — gated on [`FS_READ`], never shelling out (so no exec cap).
+fn list() -> FnEndpoint {
+    FnEndpoint::new("repo-list", |inv: &Invocation<'_>| {
+        if !inv.capability.allows(FS_READ) {
+            return Err(Error::Endpoint(format!(
+                "repo-list: capability does not grant `{FS_READ}`"
+            )));
+        }
+        let root = repo_root(inv)?;
+        let entries = std::fs::read_dir(&root).map_err(|e| {
+            Error::Endpoint(format!(
+                "repo-list: cannot read root `{}`: {e}",
+                root.display()
+            ))
+        })?;
+        let mut repos: Vec<(String, String)> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // One level deep only: an immediate child dir carrying a `.git`.
+            if path.is_dir() && path.join(".git").exists() {
+                // Skip non-UTF-8 names rather than mangle them.
+                let Ok(name) = entry.file_name().into_string() else {
+                    continue;
+                };
+                // Absolute path; fall back to the joined path if canonicalize fails.
+                let abs = path.canonicalize().unwrap_or(path);
+                repos.push((name, abs.display().to_string()));
+            }
+        }
+        repos.sort();
+        let body = repos
+            .into_iter()
+            .map(|(name, path)| format!("{name}\t{path}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // TODO(turtle): an `as=text/turtle` face — skolemized `urn:repo:{name}`
+        // with rdfs:label + a path predicate — is a clean follow-up, but the
+        // path predicate is a vocab decision (ikigai-rs.dev/ns#) that belongs
+        // upstream; left for the hub rather than minting a term here.
+        Ok(text(body))
+    })
+    .with_description(
+        Description::new("repo-list")
+            .title("List repositories")
+            .summary(
+                "Enumerate the git repositories under a ROOT — each as name<TAB>path, one per \
+                 line — so an agent whose cwd is not a repo (e.g. ikigai mcp) can discover where \
+                 repos live and pass one as dir= to the urn:repo:* facades. ROOT is root= (arg), \
+                 else $IKIGAI_REPO_ROOT, else ~/git-personal; immediate child directories only.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .requires(FS_READ)
+            .input(
+                ArgSpec::new("root")
+                    .summary(
+                        "the directory to scan (default: $IKIGAI_REPO_ROOT, else ~/git-personal)",
+                    )
+                    .optional(),
+            )
+            .output("text/plain;charset=utf-8"),
+    )
+}
+
 /// The dev-tooling space: the exec seam + the read facades.
 pub fn space() -> EndpointSpace {
     EndpointSpace::new()
@@ -232,6 +335,7 @@ pub fn space() -> EndpointSpace {
                 &["branch", "--show-current"],
             ),
         )
+        .bind(Exact::new("urn:repo:list"), list())
         .bind(
             Exact::new("urn:repo:pr:checks"),
             gh_pr_facade(
@@ -334,5 +438,42 @@ mod tests {
         // In CI/checkout this resolves to a branch name (or empty on detached HEAD);
         // either way it must not error under the right capability.
         assert!(out.is_ok(), "{out:?}");
+    }
+
+    #[test]
+    fn list_enumerates_repos_under_root() {
+        // A self-contained ROOT: two fake repos (dirs holding a `.git`) plus a
+        // decoy non-repo dir — no dependency on ~/git-personal.
+        let base =
+            std::env::temp_dir().join(format!("ikigai-repo-list-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for name in ["alpha", "beta"] {
+            std::fs::create_dir_all(base.join(name).join(".git")).unwrap();
+        }
+        std::fs::create_dir_all(base.join("not-a-repo")).unwrap();
+
+        let fs = Capability::scoped(["urn:cap:fs:read:*"]);
+        let out = source("urn:repo:list", &[("root", base.to_str().unwrap())], &fs).unwrap();
+        let body = String::from_utf8_lossy(&out.bytes).into_owned();
+        let lines: Vec<&str> = body.lines().collect();
+
+        // Only the two `.git`-bearing dirs, sorted, name<TAB>path; decoy excluded.
+        assert_eq!(lines.len(), 2, "{body:?}");
+        assert!(lines[0].starts_with("alpha\t"), "{body:?}");
+        assert!(lines[1].starts_with("beta\t"), "{body:?}");
+        // The path column is the absolute repo directory.
+        let alpha_path = lines[0].split('\t').nth(1).unwrap();
+        assert!(alpha_path.ends_with("alpha"), "{body:?}");
+        assert!(std::path::Path::new(alpha_path).is_absolute(), "{body:?}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn list_is_capability_gated() {
+        // No fs:read grant → denied before any directory is read.
+        let none = Capability::scoped(["urn:cap:unrelated"]);
+        let err = source("urn:repo:list", &[("root", "/tmp")], &none).unwrap_err();
+        assert!(format!("{err:?}").contains("does not grant"), "{err:?}");
     }
 }
