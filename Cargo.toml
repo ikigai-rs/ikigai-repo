@@ -1,7 +1,7 @@
 [package]
 name = "ikigai-repo"
 description = "Git / gh / cargo as ikigai resources: a capability-gated exec seam + typed repo facades (urn:system:exec, urn:repo:*)."
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
