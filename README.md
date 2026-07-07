@@ -13,6 +13,7 @@ and typed **facades** sit over it:
 | `urn:repo:status` | the working tree's status (`git status --porcelain=v1 -b`) |
 | `urn:repo:log` | recent history (`git log --oneline -20`) |
 | `urn:repo:branch` | the current branch |
+| `urn:repo:list` | enumerate the git repos under a ROOT (`root=`, else `$IKIGAI_REPO_ROOT`, else `~/git-personal`) as `name`⇥`path`; a filesystem read, gated on `urn:cap:fs:read:*` (no exec cap) |
 
 Two layers gate every call: the **allowlist** (the outer bound — an unknown tool
 is refused before a process is spawned) and the **capability** (the inner bound —
