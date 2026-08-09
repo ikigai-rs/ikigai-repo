@@ -4,7 +4,8 @@
 //! capability-gated [`exec`](self) endpoint that runs an *allowlisted* external
 //! tool with an **argument vector** (never a shell string — nothing is ever
 //! interpolated into a shell, so there is no injection surface), and a set of
-//! **typed facades** over it (`urn:repo:status`, `:log`, `:branch`) that build
+//! **typed facades** over it (`urn:repo:status`, `:log`, `:branch`, and the
+//! `urn:repo:pr:*` family: `:list`, `:view`, `:diff`, `:checks`) that build
 //! the right invocation and speak the ikigai self-description. A companion
 //! `urn:repo:list` enumerates the repositories under a ROOT so an agent whose
 //! cwd is not a repo (e.g. `ikigai mcp`) can discover where to point `dir=`.
@@ -91,6 +92,51 @@ fn text(body: String) -> Representation {
     )
 }
 
+fn json(body: String) -> Representation {
+    Representation::new(ReprType::new("application/json"), body.into_bytes())
+}
+
+/// The `as=` face convention (see ikigai-org / ikigai-personal): a face is
+/// selected by substring, so `as=application/json` and `as=json` both work.
+fn wants_json(inv: &Invocation<'_>) -> bool {
+    inv.inline_str("as")
+        .map(|s| s.contains("json"))
+        .unwrap_or(false)
+}
+
+/// Parse a `limit=` argument as a count. Arguments are passed as an argv (no
+/// shell), so this is not an injection guard — it stops a stray value from
+/// becoming a *flag* (`-{limit}` with a leading dash) and gives a clean error.
+fn parse_limit(inv: &Invocation<'_>, default: u32) -> Result<u32> {
+    match inv.inline_str("limit") {
+        Ok(s) => s
+            .parse()
+            .map_err(|_| Error::Endpoint(format!("limit must be a number, got `{s}`"))),
+        Err(_) => Ok(default),
+    }
+}
+
+/// Escape a string as a JSON string literal (quotes included). The JSON faces
+/// this crate emits are built by hand — the shapes are flat and small, and a
+/// serde_json dependency for four fields would be all cost.
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// `urn:system:exec` — the low-level seam. `tool=` (allowlisted) + `args=`
 /// (newline-separated argument vector) + optional `dir=`.
 fn exec() -> FnEndpoint {
@@ -171,12 +217,15 @@ fn git_facade(
 }
 
 /// A `gh`-backed read facade over a pull request: `gh <sub…> <pr> [--repo R]`,
-/// run in `dir` (or against `--repo owner/name`). `pr=` is required.
+/// run in `dir` (or against `--repo owner/name`). `pr=` is required. When
+/// `json_fields` is given, `as=application/json` selects a structured face
+/// (`gh … --json <fields>`), passed through verbatim as `application/json`.
 fn gh_pr_facade(
     id: &'static str,
     title: &'static str,
     summary: &'static str,
     sub: &'static [&'static str],
+    json_fields: Option<&'static str>,
 ) -> FnEndpoint {
     FnEndpoint::new(id, move |inv: &Invocation<'_>| {
         let pr = inv
@@ -184,15 +233,20 @@ fn gh_pr_facade(
             .map_err(|_| Error::MissingArgument("pr (the pull-request number)".to_string()))?;
         let mut args: Vec<String> = sub.iter().map(|a| a.to_string()).collect();
         args.push(pr.to_string());
+        let want_json = json_fields.is_some() && wants_json(inv);
+        if let (Some(fields), true) = (json_fields, want_json) {
+            args.push("--json".to_string());
+            args.push(fields.to_string());
+        }
         if let Ok(repo) = inv.inline_str("repo") {
             args.push("--repo".to_string());
             args.push(repo.to_string());
         }
         let dir = inv.inline_str("dir").ok();
-        run(inv, "gh", &args, dir).map(text)
+        run(inv, "gh", &args, dir).map(if want_json { json } else { text })
     })
-    .with_description(
-        Description::new(id)
+    .with_description({
+        let mut description = Description::new(id)
             .title(title)
             .summary(summary)
             .verb(Verb::Source)
@@ -212,8 +266,181 @@ fn gh_pr_facade(
                 ArgSpec::new("dir")
                     .summary("a repo directory to run in (else the process cwd)")
                     .optional(),
+            );
+        if let Some(fields) = json_fields {
+            description = description
+                .input(
+                    ArgSpec::new("as")
+                        .summary(format!(
+                            "application/json for the structured face ({fields})"
+                        ))
+                        .one_of(["application/json"])
+                        .optional(),
+                )
+                .output("text/plain;charset=utf-8")
+                .output("application/json");
+        } else {
+            description = description.output("text/plain;charset=utf-8");
+        }
+        description
+    })
+}
+
+/// The fields the structured `urn:repo:pr:view` face carries. `headRefOid` is
+/// the PR head commit sha — the key a downstream review archive stores under
+/// (a review is *of* a commit, not of a mutable branch tip).
+const PR_VIEW_JSON_FIELDS: &str =
+    "number,title,state,isDraft,headRefName,headRefOid,baseRefName,author,updatedAt,url,body";
+
+/// The fields both faces of `urn:repo:pr:list` are built from.
+const PR_LIST_FIELDS: &str = "number,title,headRefName,updatedAt";
+
+/// The gh Go-template for the text face of `urn:repo:pr:list`: one PR per
+/// line, `number⇥title⇥branch⇥updated` (RFC 3339). Real tab/newline characters
+/// — arguments travel as an argv, never through a shell.
+const PR_LIST_TEMPLATE: &str = concat!(
+    "{{range .}}{{.number}}\t{{.title}}\t{{.headRefName}}\t",
+    "{{timefmt \"2006-01-02T15:04:05Z07:00\" .updatedAt}}\n{{end}}"
+);
+
+/// `urn:repo:pr:list` — the open pull requests, machine-readable. Both faces
+/// are built from the same `--json` export so they cannot drift: the default
+/// text face renders it through a gh template (one PR per line,
+/// `number⇥title⇥branch⇥updated`), `as=application/json` passes it through.
+fn pr_list() -> FnEndpoint {
+    FnEndpoint::new("repo-pr-list", |inv: &Invocation<'_>| {
+        let limit = parse_limit(inv, 30)?;
+        let want_json = wants_json(inv);
+        let mut args: Vec<String> = ["pr", "list", "--limit"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        args.push(limit.to_string());
+        args.push("--json".to_string());
+        args.push(PR_LIST_FIELDS.to_string());
+        if !want_json {
+            args.push("--template".to_string());
+            args.push(PR_LIST_TEMPLATE.to_string());
+        }
+        if let Ok(repo) = inv.inline_str("repo") {
+            args.push("--repo".to_string());
+            args.push(repo.to_string());
+        }
+        let dir = inv.inline_str("dir").ok();
+        run(inv, "gh", &args, dir).map(if want_json { json } else { text })
+    })
+    .with_description(
+        Description::new("repo-pr-list")
+            .title("Open pull requests")
+            .summary(
+                "The open pull requests (gh pr list), one per line as \
+                 number<TAB>title<TAB>branch<TAB>updated (RFC 3339); as=application/json for \
+                 the structured face (number, title, headRefName, updatedAt). Pass a number \
+                 to urn:repo:pr:view / :diff / :checks.",
             )
-            .output("text/plain;charset=utf-8"),
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .requires("urn:cap:exec:gh")
+            .input(
+                ArgSpec::new("limit")
+                    .class("http://www.w3.org/2001/XMLSchema#integer")
+                    .summary("the maximum number of PRs to list")
+                    .default_value("30"),
+            )
+            .input(
+                ArgSpec::new("repo")
+                    .summary("owner/name (else the repo at dir=/cwd)")
+                    .optional(),
+            )
+            .input(
+                ArgSpec::new("dir")
+                    .summary("a repo directory to run in (else the process cwd)")
+                    .optional(),
+            )
+            .input(
+                ArgSpec::new("as")
+                    .summary("application/json for the structured face")
+                    .one_of(["application/json"])
+                    .optional(),
+            )
+            .output("text/plain;charset=utf-8")
+            .output("application/json"),
+    )
+}
+
+/// `urn:repo:log` — recent history. The default face is `git log --oneline`;
+/// `as=application/json` renders `[{hash, author, date, subject}]` (full sha,
+/// author name, RFC 3339 author date) parsed from a unit-separator-delimited
+/// pretty format — `%x1f` cannot appear in a commit subject that any normal
+/// tool produced, and a subject that somehow carries one merely truncates its
+/// own entry's subject field.
+fn log() -> FnEndpoint {
+    FnEndpoint::new("repo-log", |inv: &Invocation<'_>| {
+        let limit = parse_limit(inv, 20)?;
+        let mut args: Vec<String> = Vec::new();
+        if let Ok(dir) = inv.inline_str("dir") {
+            args.push("-C".to_string());
+            args.push(dir.to_string());
+        }
+        args.push("log".to_string());
+        if wants_json(inv) {
+            args.push("--pretty=format:%H%x1f%an%x1f%aI%x1f%s".to_string());
+            args.push(format!("-{limit}"));
+            run(inv, "git", &args, None).map(|raw| {
+                let entries: Vec<String> = raw
+                    .lines()
+                    .filter_map(|line| {
+                        let mut parts = line.splitn(4, '\x1f');
+                        match (parts.next(), parts.next(), parts.next(), parts.next()) {
+                            (Some(hash), Some(author), Some(date), Some(subject)) => Some(format!(
+                                "{{\"hash\":{},\"author\":{},\"date\":{},\"subject\":{}}}",
+                                json_str(hash),
+                                json_str(author),
+                                json_str(date),
+                                json_str(subject)
+                            )),
+                            _ => None,
+                        }
+                    })
+                    .collect();
+                json(format!("[{}]", entries.join(",")))
+            })
+        } else {
+            args.push("--oneline".to_string());
+            args.push(format!("-{limit}"));
+            run(inv, "git", &args, None).map(text)
+        }
+    })
+    .with_description(
+        Description::new("repo-log")
+            .title("Recent history")
+            .summary(
+                "The recent commits: one line each by default (git log --oneline); \
+                 as=application/json for [{hash, author, date, subject}] with the full sha \
+                 and RFC 3339 author date.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .requires("urn:cap:exec:git")
+            .input(
+                ArgSpec::new("limit")
+                    .class("http://www.w3.org/2001/XMLSchema#integer")
+                    .summary("the number of commits to show")
+                    .default_value("20"),
+            )
+            .input(
+                ArgSpec::new("dir")
+                    .summary("the repository directory (defaults to the process cwd)")
+                    .optional(),
+            )
+            .input(
+                ArgSpec::new("as")
+                    .summary("application/json for the structured face")
+                    .one_of(["application/json"])
+                    .optional(),
+            )
+            .output("text/plain;charset=utf-8")
+            .output("application/json"),
     )
 }
 
@@ -322,15 +549,7 @@ pub fn space() -> EndpointSpace {
                 &["status", "--porcelain=v1", "-b"],
             ),
         )
-        .bind(
-            Exact::new("urn:repo:log"),
-            git_facade(
-                "repo-log",
-                "Recent history",
-                "The last 20 commits, one line each (git log --oneline -20).",
-                &["log", "--oneline", "-20"],
-            ),
-        )
+        .bind(Exact::new("urn:repo:log"), log())
         .bind(
             Exact::new("urn:repo:branch"),
             git_facade(
@@ -350,6 +569,7 @@ pub fn space() -> EndpointSpace {
                  SNAPSHOT — for a blocking wait use gh's own --watch; the standing poll job \
                  (host-side, time transport) is what removes the wait from an agent's loop.",
                 &["pr", "checks"],
+                None,
             ),
         )
         .bind(
@@ -357,8 +577,24 @@ pub fn space() -> EndpointSpace {
             gh_pr_facade(
                 "repo-pr-view",
                 "PR overview",
-                "A pull request's title, state, and metadata (gh pr view).",
+                "A pull request's title, state, and metadata (gh pr view); \
+                 as=application/json for the structured face, which carries headRefOid — \
+                 the PR head commit sha a review archive keys on.",
                 &["pr", "view"],
+                Some(PR_VIEW_JSON_FIELDS),
+            ),
+        )
+        .bind(Exact::new("urn:repo:pr:list"), pr_list())
+        .bind(
+            Exact::new("urn:repo:pr:diff"),
+            gh_pr_facade(
+                "repo-pr-diff",
+                "PR diff",
+                "A pull request's unified diff (gh pr diff) — the raw change an explainer \
+                 or reviewer reads. Pair with urn:repo:pr:view as=application/json for the \
+                 head sha the diff corresponds to.",
+                &["pr", "diff"],
+                None,
             ),
         )
 }
@@ -476,6 +712,131 @@ mod tests {
         assert!(std::path::Path::new(alpha_path).is_absolute(), "{body:?}");
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pr_list_and_diff_are_gated() {
+        // No exec:gh grant → typed, permanent Denied before any gh runs.
+        let bare = Capability::scoped(["urn:cap:exec:git"]);
+        let err = source("urn:repo:pr:list", &[], &bare).unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+        let err = source("urn:repo:pr:diff", &[("pr", "1")], &bare).unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+
+        // pr:diff without pr= → a clean missing-argument error (still no gh run).
+        let gh = Capability::scoped(["urn:cap:exec:gh"]);
+        let err = source("urn:repo:pr:diff", &[], &gh).unwrap_err();
+        assert!(format!("{err:?}").contains("MissingArgument"), "{err:?}");
+
+        // A non-numeric limit= is refused before gh is spawned — a stray value
+        // must never become a flag (`-{limit}`).
+        let err = source("urn:repo:pr:list", &[("limit", "nope")], &gh).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("limit must be a number"),
+            "{err:?}"
+        );
+    }
+
+    /// The describe() shapes ARE the module's contract — the engine routes
+    /// named args by them, selection matches on them, MCP projects them.
+    #[test]
+    fn descriptions_declare_faces_args_and_caps() {
+        use ikigai_core::Endpoint;
+
+        // pr:list: exec:gh, limit default 30 (xsd:integer), a json face, both outputs.
+        let d = pr_list().describe();
+        assert!(d.requires.contains(&"urn:cap:exec:gh".to_string()), "{d:?}");
+        let limit = d.inputs.iter().find(|a| a.name == "limit").unwrap();
+        assert_eq!(limit.default.as_deref(), Some("30"));
+        assert!(!limit.required);
+        assert_eq!(
+            limit.class.as_deref(),
+            Some("http://www.w3.org/2001/XMLSchema#integer")
+        );
+        let face = d.inputs.iter().find(|a| a.name == "as").unwrap();
+        assert_eq!(face.one_of, vec!["application/json".to_string()]);
+        assert!(d.outputs.iter().any(|o| o == "application/json"), "{d:?}");
+        assert!(
+            d.outputs.iter().any(|o| o.starts_with("text/plain")),
+            "{d:?}"
+        );
+
+        // pr:view: gains the json face (it carries headRefOid — the head sha).
+        let d = gh_pr_facade(
+            "repo-pr-view",
+            "t",
+            "s",
+            &["pr", "view"],
+            Some(PR_VIEW_JSON_FIELDS),
+        )
+        .describe();
+        let face = d.inputs.iter().find(|a| a.name == "as").unwrap();
+        assert!(face.summary.contains("headRefOid"), "{face:?}");
+        assert!(d.outputs.iter().any(|o| o == "application/json"), "{d:?}");
+
+        // pr:diff: text-only (no as= arg, one output), pr= required.
+        let d = gh_pr_facade("repo-pr-diff", "t", "s", &["pr", "diff"], None).describe();
+        assert!(d.inputs.iter().all(|a| a.name != "as"), "{d:?}");
+        assert_eq!(d.outputs, vec!["text/plain;charset=utf-8".to_string()]);
+        assert!(d.inputs.iter().find(|a| a.name == "pr").unwrap().required);
+
+        // log: exec:git, limit default 20, both faces.
+        let d = log().describe();
+        assert!(
+            d.requires.contains(&"urn:cap:exec:git".to_string()),
+            "{d:?}"
+        );
+        let limit = d.inputs.iter().find(|a| a.name == "limit").unwrap();
+        assert_eq!(limit.default.as_deref(), Some("20"));
+        assert!(d.outputs.iter().any(|o| o == "application/json"), "{d:?}");
+    }
+
+    #[test]
+    fn log_faces_read_this_repo() {
+        let git = Capability::scoped(["urn:cap:exec:git"]);
+
+        // Default face: oneline, limit honored.
+        let out = source("urn:repo:log", &[("limit", "2")], &git).unwrap();
+        assert!(out.repr_type.media_type.starts_with("text/plain"));
+        let body = String::from_utf8_lossy(&out.bytes).into_owned();
+        assert_eq!(body.lines().count(), 2, "{body:?}");
+
+        // JSON face: [{hash, author, date, subject}], full sha, RFC 3339 date.
+        let out = source(
+            "urn:repo:log",
+            &[("limit", "2"), ("as", "application/json")],
+            &git,
+        )
+        .unwrap();
+        assert_eq!(out.repr_type.media_type, "application/json");
+        let body = String::from_utf8_lossy(&out.bytes).into_owned();
+        assert!(body.starts_with('[') && body.ends_with(']'), "{body:?}");
+        assert_eq!(body.matches("\"hash\":").count(), 2, "{body:?}");
+        for key in ["\"author\":", "\"date\":", "\"subject\":"] {
+            assert_eq!(body.matches(key).count(), 2, "{body:?}");
+        }
+        // The first hash is a full 40-hex sha; the date is RFC 3339 (has a 'T').
+        let hash = body.split("\"hash\":\"").nth(1).unwrap();
+        let hash = &hash[..hash.find('"').unwrap()];
+        assert_eq!(hash.len(), 40, "{hash:?}");
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "{hash:?}");
+        let date = body.split("\"date\":\"").nth(1).unwrap();
+        assert!(date[..date.find('"').unwrap()].contains('T'), "{body:?}");
+
+        // A non-numeric limit is refused before git runs.
+        let err = source("urn:repo:log", &[("limit", "1; rm")], &git).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("limit must be a number"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn json_str_escapes() {
+        assert_eq!(json_str("plain"), "\"plain\"");
+        assert_eq!(json_str("a \"q\" \\ b"), "\"a \\\"q\\\" \\\\ b\"");
+        assert_eq!(json_str("nl\ntab\t"), "\"nl\\ntab\\t\"");
+        assert_eq!(json_str("bell\u{7}"), "\"bell\\u0007\"");
     }
 
     #[test]
