@@ -792,19 +792,43 @@ mod tests {
     }
 
     #[test]
-    fn log_faces_read_this_repo() {
+    fn log_faces_read_a_scratch_repo() {
+        // A self-contained repo with exactly three commits — the checkout CI
+        // runs in is SHALLOW (fetch-depth 1), so this crate's own history is
+        // one merge commit deep there; never assert against it. This also
+        // exercises dir= (the facade's `git -C`).
+        let base =
+            std::env::temp_dir().join(format!("ikigai-repo-log-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let git_in = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(["-C", base.to_str().unwrap()])
+                // A hermetic identity: no dependency on the machine's config.
+                .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git_in(&["init", "-q"]);
+        for subject in ["first", "second \"quoted\"", "third"] {
+            git_in(&["commit", "-q", "--allow-empty", "-m", subject]);
+        }
+        let dir = base.to_str().unwrap();
         let git = Capability::scoped(["urn:cap:exec:git"]);
 
         // Default face: oneline, limit honored.
-        let out = source("urn:repo:log", &[("limit", "2")], &git).unwrap();
+        let out = source("urn:repo:log", &[("limit", "2"), ("dir", dir)], &git).unwrap();
         assert!(out.repr_type.media_type.starts_with("text/plain"));
         let body = String::from_utf8_lossy(&out.bytes).into_owned();
         assert_eq!(body.lines().count(), 2, "{body:?}");
+        assert!(body.lines().next().unwrap().contains("third"), "{body:?}");
 
         // JSON face: [{hash, author, date, subject}], full sha, RFC 3339 date.
         let out = source(
             "urn:repo:log",
-            &[("limit", "2"), ("as", "application/json")],
+            &[("limit", "2"), ("dir", dir), ("as", "application/json")],
             &git,
         )
         .unwrap();
@@ -822,6 +846,8 @@ mod tests {
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "{hash:?}");
         let date = body.split("\"date\":\"").nth(1).unwrap();
         assert!(date[..date.find('"').unwrap()].contains('T'), "{body:?}");
+        // A quote in a commit subject is escaped, not a broken document.
+        assert!(body.contains("second \\\"quoted\\\""), "{body:?}");
 
         // A non-numeric limit is refused before git runs.
         let err = source("urn:repo:log", &[("limit", "1; rm")], &git).unwrap_err();
@@ -829,6 +855,8 @@ mod tests {
             format!("{err:?}").contains("limit must be a number"),
             "{err:?}"
         );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
