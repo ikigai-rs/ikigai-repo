@@ -5,7 +5,7 @@
 //! tool with an **argument vector** (never a shell string — nothing is ever
 //! interpolated into a shell, so there is no injection surface), and a set of
 //! **typed facades** over it (`urn:repo:status`, `:log`, `:branch`, and the
-//! `urn:repo:pr:*` family: `:list`, `:view`, `:diff`, `:checks`) that build
+//! `urn:repo:pr:*` family: `:list`, `:view`, `:files`, `:diff`, `:checks`) that build
 //! the right invocation and speak the ikigai self-description. A companion
 //! `urn:repo:list` enumerates the repositories under a ROOT so an agent whose
 //! cwd is not a repo (e.g. `ikigai mcp`) can discover where to point `dir=`.
@@ -113,6 +113,36 @@ fn parse_limit(inv: &Invocation<'_>, default: u32) -> Result<u32> {
             .parse()
             .map_err(|_| Error::Endpoint(format!("limit must be a number, got `{s}`"))),
         Err(_) => Ok(default),
+    }
+}
+
+/// Parse the required `pr=` argument as a PR number. Like [`parse_limit`],
+/// this is a flag guard, not a shell guard (there is no shell): the value is
+/// positional in the gh argv, so a stray `--web` or `--repo …` would otherwise
+/// become a *flag* to gh. Digits-only also matches the declared xsd:integer
+/// class — the description already promises a number.
+fn parse_pr(inv: &Invocation<'_>) -> Result<u64> {
+    let s = inv
+        .inline_str("pr")
+        .map_err(|_| Error::MissingArgument("pr (the pull-request number)".to_string()))?;
+    s.parse()
+        .map_err(|_| Error::Endpoint(format!("pr must be a number, got `{s}`")))
+}
+
+/// Parse an optional `path=` argument as a pathspec. The value travels in the
+/// argv *after* `--` — git's own "everything past here is a path" delimiter —
+/// so it can never be read as a flag or a rev; the guard, like [`parse_limit`],
+/// exists to refuse a value that *looks* like a flag with a clean error
+/// instead of quietly matching nothing, and to stop the empty string (git
+/// rejects the empty pathspec with its own fatal).
+fn parse_path(inv: &Invocation<'_>) -> Result<Option<String>> {
+    match inv.inline_str("path") {
+        Ok("") => Err(Error::Endpoint("path must not be empty".to_string())),
+        Ok(s) if s.starts_with('-') => Err(Error::Endpoint(format!(
+            "path must be a pathspec, not a flag: got `{s}`"
+        ))),
+        Ok(s) => Ok(Some(s.to_string())),
+        Err(_) => Ok(None),
     }
 }
 
@@ -228,9 +258,7 @@ fn gh_pr_facade(
     json_fields: Option<&'static str>,
 ) -> FnEndpoint {
     FnEndpoint::new(id, move |inv: &Invocation<'_>| {
-        let pr = inv
-            .inline_str("pr")
-            .map_err(|_| Error::MissingArgument("pr (the pull-request number)".to_string()))?;
+        let pr = parse_pr(inv)?;
         let mut args: Vec<String> = sub.iter().map(|a| a.to_string()).collect();
         args.push(pr.to_string());
         let want_json = json_fields.is_some() && wants_json(inv);
@@ -339,6 +367,83 @@ fn pr_list_args(state: &str, limit: u32, want_json: bool, repo: Option<&str>) ->
     args
 }
 
+/// The gh Go-template for the text face of `urn:repo:pr:files`: one changed
+/// path per line. A real newline — arguments travel as an argv, never through
+/// a shell.
+const PR_FILES_TEMPLATE: &str = "{{range .files}}{{.path}}\n{{end}}";
+
+/// Build the `gh pr view --json files` argv both faces of `urn:repo:pr:files`
+/// share. Like `pr_list_args`, the text face renders the same `--json` export
+/// through a template (one path per line) so the faces cannot drift; the json
+/// face passes gh's export through verbatim.
+fn pr_files_args(pr: u64, want_json: bool, repo: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = ["pr", "view"].iter().map(|a| a.to_string()).collect();
+    args.push(pr.to_string());
+    args.push("--json".to_string());
+    args.push("files".to_string());
+    if !want_json {
+        args.push("--template".to_string());
+        args.push(PR_FILES_TEMPLATE.to_string());
+    }
+    if let Some(repo) = repo {
+        args.push("--repo".to_string());
+        args.push(repo.to_string());
+    }
+    args
+}
+
+/// `urn:repo:pr:files` — the paths a pull request changes. The open-PR half of
+/// "which PRs touch this subtree" (`urn:repo:log path=` is the merged half):
+/// intersect these paths with the subtree you are looking at. Default face is
+/// one path per line; `as=application/json` passes gh's export through —
+/// `{"files": [{path, additions, deletions, changeType}]}`.
+fn pr_files() -> FnEndpoint {
+    FnEndpoint::new("repo-pr-files", |inv: &Invocation<'_>| {
+        let pr = parse_pr(inv)?;
+        let want_json = wants_json(inv);
+        let repo = inv.inline_str("repo").ok();
+        let args = pr_files_args(pr, want_json, repo);
+        let dir = inv.inline_str("dir").ok();
+        run(inv, "gh", &args, dir).map(if want_json { json } else { text })
+    })
+    .with_description(
+        Description::new("repo-pr-files")
+            .title("PR changed files")
+            .summary(
+                "The paths a pull request changes (gh pr view --json files), one per line; \
+                 as=application/json for the structured face ({files: [{path, additions, \
+                 deletions, changeType}]}). The open-PR half of \"which PRs touch this \
+                 subtree\" — urn:repo:log path= is the merged half.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .requires("urn:cap:exec:gh")
+            .input(
+                ArgSpec::new("pr")
+                    .class("http://www.w3.org/2001/XMLSchema#integer")
+                    .summary("the pull-request number"),
+            )
+            .input(
+                ArgSpec::new("repo")
+                    .summary("owner/name (else the repo at dir=/cwd)")
+                    .optional(),
+            )
+            .input(
+                ArgSpec::new("dir")
+                    .summary("a repo directory to run in (else the process cwd)")
+                    .optional(),
+            )
+            .input(
+                ArgSpec::new("as")
+                    .summary("application/json for the structured face")
+                    .one_of(["application/json"])
+                    .optional(),
+            )
+            .output("text/plain;charset=utf-8")
+            .output("application/json"),
+    )
+}
+
 /// `urn:repo:pr:list` — the pull requests, most recently updated first,
 /// machine-readable. `state=` filters (open by default; `all` for a mixed
 /// listing). Both faces are built from the same `--json` export so they cannot
@@ -415,41 +520,57 @@ fn pr_list() -> FnEndpoint {
 /// pretty format — `%x1f` cannot appear in a commit subject that any normal
 /// tool produced, and a subject that somehow carries one merely truncates its
 /// own entry's subject field.
+///
+/// `path=` restricts either face to the commits that touched a file or
+/// subtree (`git log … -- <path>`), composing with `limit=`. Under the house
+/// squash-merge style — `(#N)` at the end of every merge subject — a
+/// path-scoped log IS the merged-PR-per-path index; extracting the numbers
+/// stays downstream (a presentation concern), this face delivers honest
+/// subjects.
 fn log() -> FnEndpoint {
     FnEndpoint::new("repo-log", |inv: &Invocation<'_>| {
         let limit = parse_limit(inv, 20)?;
+        let path = parse_path(inv)?;
+        let want_json = wants_json(inv);
         let mut args: Vec<String> = Vec::new();
         if let Ok(dir) = inv.inline_str("dir") {
             args.push("-C".to_string());
             args.push(dir.to_string());
         }
         args.push("log".to_string());
-        if wants_json(inv) {
+        if want_json {
             args.push("--pretty=format:%H%x1f%an%x1f%aI%x1f%s".to_string());
-            args.push(format!("-{limit}"));
-            run(inv, "git", &args, None).map(|raw| {
-                let entries: Vec<String> = raw
-                    .lines()
-                    .filter_map(|line| {
-                        let mut parts = line.splitn(4, '\x1f');
-                        match (parts.next(), parts.next(), parts.next(), parts.next()) {
-                            (Some(hash), Some(author), Some(date), Some(subject)) => Some(format!(
-                                "{{\"hash\":{},\"author\":{},\"date\":{},\"subject\":{}}}",
-                                json_str(hash),
-                                json_str(author),
-                                json_str(date),
-                                json_str(subject)
-                            )),
-                            _ => None,
-                        }
-                    })
-                    .collect();
-                json(format!("[{}]", entries.join(",")))
-            })
         } else {
             args.push("--oneline".to_string());
-            args.push(format!("-{limit}"));
-            run(inv, "git", &args, None).map(text)
+        }
+        args.push(format!("-{limit}"));
+        // The pathspec rides after `--`, so it reaches git as a path and only
+        // a path — the same argv either face builds, shape untouched.
+        if let Some(path) = path {
+            args.push("--".to_string());
+            args.push(path);
+        }
+        let raw = run(inv, "git", &args, None)?;
+        if want_json {
+            let entries: Vec<String> = raw
+                .lines()
+                .filter_map(|line| {
+                    let mut parts = line.splitn(4, '\x1f');
+                    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+                        (Some(hash), Some(author), Some(date), Some(subject)) => Some(format!(
+                            "{{\"hash\":{},\"author\":{},\"date\":{},\"subject\":{}}}",
+                            json_str(hash),
+                            json_str(author),
+                            json_str(date),
+                            json_str(subject)
+                        )),
+                        _ => None,
+                    }
+                })
+                .collect();
+            Ok(json(format!("[{}]", entries.join(","))))
+        } else {
+            Ok(text(raw))
         }
     })
     .with_description(
@@ -458,7 +579,9 @@ fn log() -> FnEndpoint {
             .summary(
                 "The recent commits: one line each by default (git log --oneline); \
                  as=application/json for [{hash, author, date, subject}] with the full sha \
-                 and RFC 3339 author date.",
+                 and RFC 3339 author date. path= restricts to the commits that touched a \
+                 file or subtree (git log -- <path>) — under squash-merge style, the \
+                 merged-PR-per-path index.",
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
@@ -468,6 +591,11 @@ fn log() -> FnEndpoint {
                     .class("http://www.w3.org/2001/XMLSchema#integer")
                     .summary("the number of commits to show")
                     .default_value("20"),
+            )
+            .input(
+                ArgSpec::new("path")
+                    .summary("restrict to commits touching this file or subtree, relative to the repo root")
+                    .optional(),
             )
             .input(
                 ArgSpec::new("dir")
@@ -626,6 +754,7 @@ pub fn space() -> EndpointSpace {
             ),
         )
         .bind(Exact::new("urn:repo:pr:list"), pr_list())
+        .bind(Exact::new("urn:repo:pr:files"), pr_files())
         .bind(
             Exact::new("urn:repo:pr:diff"),
             gh_pr_facade(
@@ -869,7 +998,7 @@ mod tests {
         assert_eq!(d.outputs, vec!["text/plain;charset=utf-8".to_string()]);
         assert!(d.inputs.iter().find(|a| a.name == "pr").unwrap().required);
 
-        // log: exec:git, limit default 20, both faces.
+        // log: exec:git, limit default 20, both faces, path= optional.
         let d = log().describe();
         assert!(
             d.requires.contains(&"urn:cap:exec:git".to_string()),
@@ -878,6 +1007,25 @@ mod tests {
         let limit = d.inputs.iter().find(|a| a.name == "limit").unwrap();
         assert_eq!(limit.default.as_deref(), Some("20"));
         assert!(d.outputs.iter().any(|o| o == "application/json"), "{d:?}");
+        let path = d.inputs.iter().find(|a| a.name == "path").unwrap();
+        assert!(!path.required, "{path:?}");
+
+        // pr:files: exec:gh, pr= required (xsd:integer), a json face, both outputs.
+        let d = pr_files().describe();
+        assert!(d.requires.contains(&"urn:cap:exec:gh".to_string()), "{d:?}");
+        let pr = d.inputs.iter().find(|a| a.name == "pr").unwrap();
+        assert!(pr.required, "{pr:?}");
+        assert_eq!(
+            pr.class.as_deref(),
+            Some("http://www.w3.org/2001/XMLSchema#integer")
+        );
+        let face = d.inputs.iter().find(|a| a.name == "as").unwrap();
+        assert_eq!(face.one_of, vec!["application/json".to_string()]);
+        assert!(d.outputs.iter().any(|o| o == "application/json"), "{d:?}");
+        assert!(
+            d.outputs.iter().any(|o| o.starts_with("text/plain")),
+            "{d:?}"
+        );
     }
 
     #[test]
@@ -946,6 +1094,137 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn log_path_scopes_a_scratch_repo() {
+        // A self-contained repo (CI checkouts are shallow — never assert
+        // against the enclosing repo's history) with commits touching three
+        // distinct paths, so `path=` has something real to exclude.
+        let base =
+            std::env::temp_dir().join(format!("ikigai-repo-log-path-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        let git_in = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(["-C", base.to_str().unwrap()])
+                .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git_in(&["init", "-q"]);
+        for (file, subject) in [
+            ("a.txt", "touch a (#1)"),
+            ("sub/b.txt", "touch sub (#2)"),
+            ("a.txt", "touch a again (#3)"),
+        ] {
+            std::fs::write(base.join(file), subject).unwrap();
+            git_in(&["add", file]);
+            git_in(&["commit", "-q", "-m", subject]);
+        }
+        let dir = base.to_str().unwrap();
+        let git = Capability::scoped(["urn:cap:exec:git"]);
+
+        // path= narrows the text face to the commits that touched the subtree.
+        let out = source("urn:repo:log", &[("dir", dir), ("path", "sub")], &git).unwrap();
+        let body = String::from_utf8_lossy(&out.bytes).into_owned();
+        assert_eq!(body.lines().count(), 1, "{body:?}");
+        assert!(body.contains("touch sub (#2)"), "{body:?}");
+
+        // …and composes with limit=: two a-touching commits, newest first,
+        // limit=1 keeps only the newest.
+        let out = source(
+            "urn:repo:log",
+            &[("dir", dir), ("path", "a.txt"), ("limit", "1")],
+            &git,
+        )
+        .unwrap();
+        let body = String::from_utf8_lossy(&out.bytes).into_owned();
+        assert_eq!(body.lines().count(), 1, "{body:?}");
+        assert!(body.contains("touch a again (#3)"), "{body:?}");
+
+        // The JSON face takes the same pathspec: honest subjects, same scope.
+        let out = source(
+            "urn:repo:log",
+            &[("dir", dir), ("path", "a.txt"), ("as", "application/json")],
+            &git,
+        )
+        .unwrap();
+        assert_eq!(out.repr_type.media_type, "application/json");
+        let body = String::from_utf8_lossy(&out.bytes).into_owned();
+        assert_eq!(body.matches("\"subject\":").count(), 2, "{body:?}");
+        assert!(body.contains("touch a again (#3)"), "{body:?}");
+        assert!(!body.contains("touch sub"), "{body:?}");
+
+        // A path that looks like a flag is refused before git runs — it could
+        // never act as one (it rides after `--`), but silence would be worse.
+        let err = source("urn:repo:log", &[("dir", dir), ("path", "--all")], &git).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("path must be a pathspec"),
+            "{err:?}"
+        );
+        // The empty pathspec is refused with our error, not git's fatal.
+        let err = source("urn:repo:log", &[("dir", dir), ("path", "")], &git).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("path must not be empty"),
+            "{err:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The `gh pr view --json files` argv is the contract with gh: both faces
+    /// share one export, the text face rendering it as one path per line.
+    #[test]
+    fn pr_files_builds_the_gh_invocation() {
+        // Text face: the export plus the per-path template.
+        let args = pr_files_args(7, false, None);
+        assert_eq!(args[..5], ["pr", "view", "7", "--json", "files"]);
+        let at = args.iter().position(|a| a == "--template").unwrap();
+        assert_eq!(args[at + 1], PR_FILES_TEMPLATE);
+        assert!(
+            PR_FILES_TEMPLATE.contains("{{.path}}"),
+            "{PR_FILES_TEMPLATE}"
+        );
+        assert!(PR_FILES_TEMPLATE.contains('\n'), "one path per line");
+
+        // JSON face: no template — gh's export passes through verbatim.
+        // repo= appends.
+        let args = pr_files_args(7, true, Some("owner/name"));
+        assert!(args.iter().all(|a| a != "--template"), "{args:?}");
+        assert_eq!(args[args.len() - 2..], ["--repo", "owner/name"]);
+    }
+
+    #[test]
+    fn pr_files_is_gated_and_guards_pr() {
+        // No exec:gh grant → typed, permanent Denied before any gh runs.
+        let bare = Capability::scoped(["urn:cap:exec:git"]);
+        let err = source("urn:repo:pr:files", &[("pr", "1")], &bare).unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+        assert!(!err.is_transient(), "{err:?}");
+
+        // With the grant but no pr= → a clean missing-argument error.
+        let gh = Capability::scoped(["urn:cap:exec:gh"]);
+        let err = source("urn:repo:pr:files", &[], &gh).unwrap_err();
+        assert!(format!("{err:?}").contains("MissingArgument"), "{err:?}");
+
+        // A non-numeric pr= is refused before gh is spawned — the value is
+        // positional in the argv, so a stray `--web` would otherwise become a
+        // flag to gh. The same guard now fronts the whole pr:* family.
+        for iri in [
+            "urn:repo:pr:files",
+            "urn:repo:pr:view",
+            "urn:repo:pr:diff",
+            "urn:repo:pr:checks",
+        ] {
+            let err = source(iri, &[("pr", "--web")], &gh).unwrap_err();
+            assert!(
+                format!("{err:?}").contains("pr must be a number"),
+                "{iri}: {err:?}"
+            );
+        }
     }
 
     #[test]
