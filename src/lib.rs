@@ -292,55 +292,96 @@ fn gh_pr_facade(
 const PR_VIEW_JSON_FIELDS: &str =
     "number,title,state,isDraft,headRefName,headRefOid,baseRefName,author,updatedAt,url,body";
 
-/// The fields both faces of `urn:repo:pr:list` are built from.
-const PR_LIST_FIELDS: &str = "number,title,headRefName,updatedAt";
+/// The fields both faces of `urn:repo:pr:list` are built from. `state` is
+/// gh's own value — `OPEN` / `CLOSED` / `MERGED`, uppercase — so a mixed
+/// (`state=all`) listing stays legible.
+const PR_LIST_FIELDS: &str = "number,title,state,headRefName,updatedAt";
+
+/// The states `urn:repo:pr:list` will filter by — `gh pr list --state`'s own
+/// vocabulary, `open` being gh's (and our) default.
+const PR_LIST_STATES: &[&str] = &["open", "closed", "merged", "all"];
 
 /// The gh Go-template for the text face of `urn:repo:pr:list`: one PR per
-/// line, `number⇥title⇥branch⇥updated` (RFC 3339). Real tab/newline characters
-/// — arguments travel as an argv, never through a shell.
+/// line, `number⇥title⇥state⇥branch⇥updated` (RFC 3339). Real tab/newline
+/// characters — arguments travel as an argv, never through a shell.
 const PR_LIST_TEMPLATE: &str = concat!(
-    "{{range .}}{{.number}}\t{{.title}}\t{{.headRefName}}\t",
+    "{{range .}}{{.number}}\t{{.title}}\t{{.state}}\t{{.headRefName}}\t",
     "{{timefmt \"2006-01-02T15:04:05Z07:00\" .updatedAt}}\n{{end}}"
 );
 
-/// `urn:repo:pr:list` — the open pull requests, machine-readable. Both faces
-/// are built from the same `--json` export so they cannot drift: the default
-/// text face renders it through a gh template (one PR per line,
-/// `number⇥title⇥branch⇥updated`), `as=application/json` passes it through.
+/// Build the `gh pr list` argv. `gh pr list`'s own order is newest-CREATED
+/// first; a listing exists to answer "what moved lately", so we always ask for
+/// most-recently-UPDATED first. The search qualifier is the only sort gh
+/// exposes: `--search "sort:updated-desc"` routes the listing through the
+/// search API, which composes with `--state` (gh folds it into the query;
+/// `merged` becomes `is:merged`) and leaves both faces' shapes untouched
+/// (verified against repos where creation and update order diverge).
+fn pr_list_args(state: &str, limit: u32, want_json: bool, repo: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = ["pr", "list", "--state"]
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+    args.push(state.to_string());
+    args.push("--limit".to_string());
+    args.push(limit.to_string());
+    args.push("--search".to_string());
+    args.push("sort:updated-desc".to_string());
+    args.push("--json".to_string());
+    args.push(PR_LIST_FIELDS.to_string());
+    if !want_json {
+        args.push("--template".to_string());
+        args.push(PR_LIST_TEMPLATE.to_string());
+    }
+    if let Some(repo) = repo {
+        args.push("--repo".to_string());
+        args.push(repo.to_string());
+    }
+    args
+}
+
+/// `urn:repo:pr:list` — the pull requests, most recently updated first,
+/// machine-readable. `state=` filters (open by default; `all` for a mixed
+/// listing). Both faces are built from the same `--json` export so they cannot
+/// drift: the default text face renders it through a gh template (one PR per
+/// line, `number⇥title⇥state⇥branch⇥updated`), `as=application/json` passes it
+/// through.
 fn pr_list() -> FnEndpoint {
     FnEndpoint::new("repo-pr-list", |inv: &Invocation<'_>| {
+        let state = inv.inline_str("state").unwrap_or("open");
+        if !PR_LIST_STATES.contains(&state) {
+            // Refused before gh is spawned — a stray value must never become
+            // part of the search invocation.
+            return Err(Error::Endpoint(format!(
+                "state must be one of {}, got `{state}`",
+                PR_LIST_STATES.join(", ")
+            )));
+        }
         let limit = parse_limit(inv, 30)?;
         let want_json = wants_json(inv);
-        let mut args: Vec<String> = ["pr", "list", "--limit"]
-            .iter()
-            .map(|a| a.to_string())
-            .collect();
-        args.push(limit.to_string());
-        args.push("--json".to_string());
-        args.push(PR_LIST_FIELDS.to_string());
-        if !want_json {
-            args.push("--template".to_string());
-            args.push(PR_LIST_TEMPLATE.to_string());
-        }
-        if let Ok(repo) = inv.inline_str("repo") {
-            args.push("--repo".to_string());
-            args.push(repo.to_string());
-        }
+        let repo = inv.inline_str("repo").ok();
+        let args = pr_list_args(state, limit, want_json, repo);
         let dir = inv.inline_str("dir").ok();
         run(inv, "gh", &args, dir).map(if want_json { json } else { text })
     })
     .with_description(
         Description::new("repo-pr-list")
-            .title("Open pull requests")
+            .title("Pull requests")
             .summary(
-                "The open pull requests (gh pr list), one per line as \
-                 number<TAB>title<TAB>branch<TAB>updated (RFC 3339); as=application/json for \
-                 the structured face (number, title, headRefName, updatedAt). Pass a number \
-                 to urn:repo:pr:view / :diff / :checks.",
+                "The pull requests, most recently updated first (gh pr list), one per line as \
+                 number<TAB>title<TAB>state<TAB>branch<TAB>updated (RFC 3339, state \
+                 OPEN/CLOSED/MERGED); state= filters (default open, all for a mixed listing); \
+                 as=application/json for the structured face (number, title, state, headRefName, \
+                 updatedAt). Pass a number to urn:repo:pr:view / :diff / :checks.",
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
             .requires("urn:cap:exec:gh")
+            .input(
+                ArgSpec::new("state")
+                    .summary("which PRs to list by state")
+                    .one_of(PR_LIST_STATES.iter().copied())
+                    .default_value("open"),
+            )
             .input(
                 ArgSpec::new("limit")
                     .class("http://www.w3.org/2001/XMLSchema#integer")
@@ -735,6 +776,48 @@ mod tests {
             format!("{err:?}").contains("limit must be a number"),
             "{err:?}"
         );
+
+        // A state outside the one_of vocabulary is refused before gh is
+        // spawned, and the error names the valid values.
+        let err = source("urn:repo:pr:list", &[("state", "draft")], &gh).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("state must be one of open, closed, merged, all"),
+            "{err:?}"
+        );
+    }
+
+    /// The `gh pr list` argv is the contract with gh: state filter, recency
+    /// sort, and the fields both faces are built from.
+    #[test]
+    fn pr_list_builds_the_gh_invocation() {
+        // Default shape (text face): state open, always sorted by recency of
+        // update via the search API (gh's own order is newest-created first),
+        // and the template renders the five-column line — state included, so a
+        // mixed listing is legible.
+        let args = pr_list_args("open", 30, false, None);
+        assert_eq!(args[..4], ["pr", "list", "--state", "open"]);
+        let flag = |name: &str| {
+            let at = args.iter().position(|a| a == name).unwrap();
+            args[at + 1].clone()
+        };
+        assert_eq!(flag("--limit"), "30");
+        assert_eq!(flag("--search"), "sort:updated-desc");
+        assert_eq!(flag("--json"), PR_LIST_FIELDS);
+        assert!(PR_LIST_FIELDS.contains("state"), "{PR_LIST_FIELDS}");
+        let template = flag("--template");
+        assert_eq!(
+            template.matches('\t').count(),
+            4,
+            "five columns: {template:?}"
+        );
+        assert!(template.contains("{{.state}}"), "{template:?}");
+
+        // JSON face: no template — the export passes through verbatim, so the
+        // structured face carries exactly PR_LIST_FIELDS. repo= appends.
+        let args = pr_list_args("all", 10, true, Some("owner/name"));
+        assert!(args.iter().all(|a| a != "--template"), "{args:?}");
+        assert_eq!(args[3], "all");
+        assert_eq!(args[args.len() - 2..], ["--repo", "owner/name"]);
     }
 
     /// The describe() shapes ARE the module's contract — the engine routes
@@ -760,6 +843,12 @@ mod tests {
             d.outputs.iter().any(|o| o.starts_with("text/plain")),
             "{d:?}"
         );
+        // state: an enum arg — one_of is the vocabulary, default preserves the
+        // original open-only behavior.
+        let state = d.inputs.iter().find(|a| a.name == "state").unwrap();
+        assert_eq!(state.one_of, PR_LIST_STATES.to_vec());
+        assert_eq!(state.default.as_deref(), Some("open"));
+        assert!(!state.required);
 
         // pr:view: gains the json face (it carries headRefOid — the head sha).
         let d = gh_pr_facade(
