@@ -11,11 +11,12 @@ and typed **facades** sit over it:
 |----------|------------|
 | `urn:system:exec` | run an allowlisted tool (`git`/`gh`/`cargo`/`just`) with `tool=` + `args=` (one arg per line) + `dir=`; gated on `urn:cap:exec:{tool}` |
 | `urn:repo:status` | the working tree's status (`git status --porcelain=v1 -b`) |
-| `urn:repo:log` | recent history (`git log --oneline`, `limit=` commits, default 20); `as=application/json` → `[{hash, author, date, subject}]` (full sha, RFC 3339 date) |
+| `urn:repo:log` | recent history (`git log --oneline`, `limit=` commits, default 20); `path=` restricts to commits touching a file/subtree (`git log -- <path>`) — under squash-merge style, the merged-PR-per-path index; `as=application/json` → `[{hash, author, date, subject}]` (full sha, RFC 3339 date) |
 | `urn:repo:branch` | the current branch |
 | `urn:repo:list` | enumerate the git repos under a ROOT (`root=`, else `$IKIGAI_REPO_ROOT`, else `~/git-personal`) as `name`⇥`path`; a filesystem read, gated on `urn:cap:fs:read:*` (no exec cap) |
 | `urn:repo:pr:list` | the PRs, most recently updated first (`gh pr list`), one per line as `number`⇥`title`⇥`state`⇥`branch`⇥`updated` (RFC 3339); `state=` (open/closed/merged/all, default open); `as=application/json` for the structured face; `limit=` (default 30) |
 | `urn:repo:pr:view` | a PR's title, state, and metadata (`gh pr view N`); `as=application/json` for the structured face, incl. `headRefOid` — the PR head commit sha |
+| `urn:repo:pr:files` | the paths a PR changes (`gh pr view N --json files`), one per line; `as=application/json` → `{files: [{path, additions, deletions, changeType}]}` — the open-PR half of "which PRs touch this subtree" (`urn:repo:log path=` is the merged half) |
 | `urn:repo:pr:diff` | a PR's unified diff (`gh pr diff N`) — the raw change an explainer/reviewer reads |
 | `urn:repo:pr:checks` | the CI check runs for a PR and their state (`gh pr checks N`) — a snapshot, not a wait |
 
