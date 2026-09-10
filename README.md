@@ -44,5 +44,20 @@ let kernel = Kernel::new(Arc::new(ikigai_repo::space()));
 
 Run `cargo run --example repo-demo` to watch it read its own git state.
 
+## Conformance
+
+The module **passes
+[`ikigai-conformance`](https://github.com/ikigai-rs/ikigai-conformance)**
+(`tests/conformance.rs`): every check runs — typed inputs, declared = enforced,
+cacheability, pipeline citizenship, naming — over a hermetic scratch repository
+(CI checkouts are shallow, so nothing reads this repo's own history). Nothing
+here is cached, by design: every read is of a working tree, git state, a
+directory, or GitHub, and no host signal names "this working tree changed" —
+the workspace watcher cuts `urn:file:<path>` per file, relative to a root the
+module cannot see from an absolute `dir=` — so every representation is live.
+The `urn:repo:pr:*` facades are opted out of the checks that fire them
+("reaches api.github.com"); the static checks still hold them, and their
+capability gate is pinned by a test of its own.
+
 ## License
 Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT).
