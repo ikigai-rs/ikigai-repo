@@ -46,6 +46,16 @@ const ALLOWED_TOOLS: &[&str] = &["git", "gh", "cargo", "just"];
 /// wildcard token is the literal grant, not a prefix rule.
 const FS_READ: &str = "urn:cap:fs:read:*";
 
+/// The XSD datatype every scalar input here carries. Paths (`dir`, `root`,
+/// `path`), an `owner/name` slug, a face selector, a state word, a tool name:
+/// all strings on the wire. `args` is the one list-valued input — a
+/// newline-separated argument vector — and there is no ArgSpec spelling for a
+/// list, so it is declared as the string the wire carries.
+const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+
+/// The XSD datatype of the counted inputs (`pr`, `limit`).
+const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+
 /// Run an allowlisted tool with an argument vector in `dir`, capability-gated.
 /// Returns its stdout on success (exit 0); a missing capability is a typed,
 /// permanent [`Error::Denied`], while a non-zero exit or a spawn failure is an
@@ -197,16 +207,19 @@ fn exec() -> FnEndpoint {
             .requires("urn:cap:exec:*")
             .input(
                 ArgSpec::new("tool")
+                    .class(XSD_STRING)
                     .summary("the tool to run")
                     .one_of(ALLOWED_TOOLS.iter().copied()),
             )
             .input(
                 ArgSpec::new("args")
+                    .class(XSD_STRING)
                     .summary("the argument vector, one argument per line")
                     .optional(),
             )
             .input(
                 ArgSpec::new("dir")
+                    .class(XSD_STRING)
                     .summary("working directory (defaults to the process cwd)")
                     .optional(),
             )
@@ -239,6 +252,7 @@ fn git_facade(
             .requires("urn:cap:exec:git")
             .input(
                 ArgSpec::new("dir")
+                    .class(XSD_STRING)
                     .summary("the repository directory (defaults to the process cwd)")
                     .optional(),
             )
@@ -282,16 +296,18 @@ fn gh_pr_facade(
             .requires("urn:cap:exec:gh")
             .input(
                 ArgSpec::new("pr")
-                    .class("http://www.w3.org/2001/XMLSchema#integer")
+                    .class(XSD_INTEGER)
                     .summary("the pull-request number"),
             )
             .input(
                 ArgSpec::new("repo")
+                    .class(XSD_STRING)
                     .summary("owner/name (else the repo at dir=/cwd)")
                     .optional(),
             )
             .input(
                 ArgSpec::new("dir")
+                    .class(XSD_STRING)
                     .summary("a repo directory to run in (else the process cwd)")
                     .optional(),
             );
@@ -299,6 +315,7 @@ fn gh_pr_facade(
             description = description
                 .input(
                     ArgSpec::new("as")
+                        .class(XSD_STRING)
                         .summary(format!(
                             "application/json for the structured face ({fields})"
                         ))
@@ -420,21 +437,24 @@ fn pr_files() -> FnEndpoint {
             .requires("urn:cap:exec:gh")
             .input(
                 ArgSpec::new("pr")
-                    .class("http://www.w3.org/2001/XMLSchema#integer")
+                    .class(XSD_INTEGER)
                     .summary("the pull-request number"),
             )
             .input(
                 ArgSpec::new("repo")
+                    .class(XSD_STRING)
                     .summary("owner/name (else the repo at dir=/cwd)")
                     .optional(),
             )
             .input(
                 ArgSpec::new("dir")
+                    .class(XSD_STRING)
                     .summary("a repo directory to run in (else the process cwd)")
                     .optional(),
             )
             .input(
                 ArgSpec::new("as")
+                    .class(XSD_STRING)
                     .summary("application/json for the structured face")
                     .one_of(["application/json"])
                     .optional(),
@@ -483,28 +503,32 @@ fn pr_list() -> FnEndpoint {
             .requires("urn:cap:exec:gh")
             .input(
                 ArgSpec::new("state")
+                    .class(XSD_STRING)
                     .summary("which PRs to list by state")
                     .one_of(PR_LIST_STATES.iter().copied())
                     .default_value("open"),
             )
             .input(
                 ArgSpec::new("limit")
-                    .class("http://www.w3.org/2001/XMLSchema#integer")
+                    .class(XSD_INTEGER)
                     .summary("the maximum number of PRs to list")
                     .default_value("30"),
             )
             .input(
                 ArgSpec::new("repo")
+                    .class(XSD_STRING)
                     .summary("owner/name (else the repo at dir=/cwd)")
                     .optional(),
             )
             .input(
                 ArgSpec::new("dir")
+                    .class(XSD_STRING)
                     .summary("a repo directory to run in (else the process cwd)")
                     .optional(),
             )
             .input(
                 ArgSpec::new("as")
+                    .class(XSD_STRING)
                     .summary("application/json for the structured face")
                     .one_of(["application/json"])
                     .optional(),
@@ -588,22 +612,22 @@ fn log() -> FnEndpoint {
             .requires("urn:cap:exec:git")
             .input(
                 ArgSpec::new("limit")
-                    .class("http://www.w3.org/2001/XMLSchema#integer")
+                    .class(XSD_INTEGER)
                     .summary("the number of commits to show")
                     .default_value("20"),
             )
             .input(
-                ArgSpec::new("path")
+                ArgSpec::new("path").class(XSD_STRING)
                     .summary("restrict to commits touching this file or subtree, relative to the repo root")
                     .optional(),
             )
             .input(
-                ArgSpec::new("dir")
+                ArgSpec::new("dir").class(XSD_STRING)
                     .summary("the repository directory (defaults to the process cwd)")
                     .optional(),
             )
             .input(
-                ArgSpec::new("as")
+                ArgSpec::new("as").class(XSD_STRING)
                     .summary("application/json for the structured face")
                     .one_of(["application/json"])
                     .optional(),
@@ -696,6 +720,7 @@ fn list() -> FnEndpoint {
             .requires(FS_READ)
             .input(
                 ArgSpec::new("root")
+                    .class(XSD_STRING)
                     .summary(
                         "the directory to scan (default: $IKIGAI_REPO_ROOT, else ~/git-personal)",
                     )
