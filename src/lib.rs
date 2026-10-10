@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use ikigai_core::{
-    ArgSpec, Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation, ReprType,
+    space_iri, ArgSpec, Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation, ReprType,
     Representation, Result, Verb,
 };
 
@@ -730,7 +730,14 @@ fn list() -> FnEndpoint {
     )
 }
 
+/// The name [`space`] claims: `urn:iki:space:repo`.
+pub const SPACE_ID: &str = "urn:iki:space:repo";
+
 /// The dev-tooling space: the exec seam + the read facades.
+///
+/// Configuration-free, so it names itself [`SPACE_ID`]: building it reads
+/// nothing. `$IKIGAI_REPO_ROOT`, `$HOME`, the process cwd and the tools on
+/// `PATH` are read per invocation, never here.
 pub fn space() -> EndpointSpace {
     EndpointSpace::new()
         .bind(Exact::new("urn:system:exec"), exec())
@@ -792,6 +799,8 @@ pub fn space() -> EndpointSpace {
                 None,
             ),
         )
+        // Last: a later `bind` drops the name (core 0.1.89).
+        .named(space_iri("repo"))
 }
 
 #[cfg(test)]

@@ -36,6 +36,13 @@
 //! [`github_facades_are_denied_under_no_grants`] pins that half itself.
 //!
 //! No module namespace: there is no RDF face. NAMES runs: every id is kebab-case.
+//!
+//! ## The space's name
+//!
+//! [`ikigai_repo::space`] is configuration-free (it reads `$IKIGAI_REPO_ROOT`,
+//! `$HOME` and the cwd per invocation, never while building), so it is declared
+//! self-named: SPACE-NAME holds it to `urn:iki:space:repo`, the same doors on
+//! every call.
 
 use ikigai_conformance::{Fixture, Report, Suite};
 use ikigai_core::{ArgRef, Capability, Error, Iri, Kernel, Representation, Request, Verb};
@@ -122,6 +129,7 @@ fn kernel() -> Kernel {
 /// opted out.
 fn suite(scratch: &Scratch) -> Suite {
     let mut suite = Suite::new()
+        .self_named_space("repo", ikigai_repo::space)
         .fixture(
             Fixture::new("system-exec", Verb::Source)
                 .arg("tool", "git")
@@ -168,6 +176,10 @@ fn conforms() {
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
     assert_shape(&report);
+    assert_eq!(
+        ikigai_core::space_iri("repo").as_str(),
+        ikigai_repo::SPACE_ID
+    );
 }
 
 fn request(iri: &str, args: &[(&str, &str)]) -> Request {
