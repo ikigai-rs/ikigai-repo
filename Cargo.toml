@@ -11,11 +11,13 @@ repository = "https://github.com/ikigai-rs/ikigai-repo"
 # The released kernel, consumed from crates.io. This module is NATIVE-ONLY: it
 # spawns subprocesses (std::process), the one thing a wasm module can't — the
 # platform seam, like ikigai-personal's EventKit. No wasm face by design.
-ikigai-core = "0.1.46"
+# 0.1.89 is the floor for `space_iri` and for `bind` dropping a name (ledger
+# #987). A 0.1.x caret is a range up to <0.2.0.
+ikigai-core = "0.1.89"
 
 [dev-dependencies]
 futures = "0.3"
-# The module recipe as one test (`tests/conformance.rs`). Its own floor on
-# `ikigai-core` (0.1.67, for `Kernel::entries`) is newer than this crate's, so
-# the dev graph resolves a newer kernel than the minimum the library states.
-ikigai-conformance = "0.2.0"
+# The module recipe as one test (`tests/conformance.rs`). 0.6.0 is the floor for
+# SPACE-NAME (ledger #987). Under 0.x a caret is also a CEILING (<0.7.0): a later
+# minor of the suite is a deliberate re-pin, not a silent upgrade.
+ikigai-conformance = "0.6.0"

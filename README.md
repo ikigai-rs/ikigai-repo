@@ -44,6 +44,8 @@ let kernel = Kernel::new(Arc::new(ikigai_repo::space()));
 
 Run `cargo run --example repo-demo` to watch it read its own git state.
 
+The space names itself `urn:iki:space:repo` (`ikigai_repo::SPACE_ID`): building it reads nothing.
+
 ## Conformance
 
 The module **passes
