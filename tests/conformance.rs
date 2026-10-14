@@ -33,7 +33,18 @@
 //! still run on them. `Suite::opt_out` also drops ENFORCED for an action — the
 //! one invoking check that never reaches the network, since the capability is
 //! checked before a process is spawned — so
-//! [`github_facades_are_denied_under_no_grants`] pins that half itself.
+//! [`github_facades_are_denied_under_no_grants`] pins that half itself. It
+//! drops REQUIRED too (each drop is a firing, after a baseline call that would
+//! reach GitHub), so [`pr_facades_refuse_a_missing_pr_typed`] pins that `pr`
+//! is really required, from a directory `gh` cannot be spawned in.
+//!
+//! ## REQUIRED on the fired actions
+//!
+//! Of the five actions the walk fires, one input is declared required with no
+//! default: `urn:system:exec`'s `tool`. REQUIRED drops it from the fixture call
+//! and holds the refusal to a typed `MissingArgument`, which spawns nothing.
+//! (Checked when adopting 0.8.0: an exec that defaulted `tool` turned this test
+//! red with a REQUIRED finding.) Every other fired input is optional.
 //!
 //! No module namespace: there is no RDF face. NAMES runs: every id is kebab-case.
 //!
@@ -214,6 +225,42 @@ fn github_facades_are_denied_under_no_grants() {
         assert!(matches!(err, Error::Denied(_)), "{id}: {err:?}");
         assert!(!err.is_transient(), "{id}: {err:?}");
     }
+}
+
+/// The REQUIRED half the opt-out blinds: each PR facade that declares `pr`
+/// required refuses its absence with a typed `MissingArgument`, as REQUIRED
+/// (ikigai-conformance 0.8.0) would hold it to. The caller is granted
+/// `urn:cap:exec:gh`, so the kernel's gate passes and the endpoint's own parse
+/// is what answers. `dir=` names a directory that does not exist, so even a
+/// facade that stopped parsing `pr` first could not spawn `gh`: the spawn
+/// fails on the working directory and the call reaches nothing.
+#[test]
+fn pr_facades_refuse_a_missing_pr_typed() {
+    let kernel = kernel();
+    let gh = Capability::scoped(vec!["urn:cap:exec:gh".to_string()]);
+    let nowhere = std::env::temp_dir().join(format!(
+        "ikigai-repo-conformance-absent-{}",
+        std::process::id()
+    ));
+    assert!(!nowhere.exists(), "{nowhere:?} must not exist");
+    let dir = nowhere.to_str().unwrap();
+    let mut takes_pr = 0;
+    for (id, iri) in GH_FACADES {
+        let description = kernel
+            .describe_pattern(iri)
+            .unwrap_or_else(|| panic!("{iri} describes itself"));
+        let Some(pr) = description.inputs.iter().find(|a| a.name == "pr") else {
+            continue;
+        };
+        assert!(pr.required && pr.default.is_none(), "{id}: {pr:?}");
+        takes_pr += 1;
+        let err = issue(&kernel, iri, &[("dir", dir)], &gh)
+            .err()
+            .unwrap_or_else(|| panic!("{id} resolved without pr="));
+        assert!(matches!(err, Error::MissingArgument(_)), "{id}: {err:?}");
+    }
+    // repo-pr-list takes no `pr`; the other four do.
+    assert_eq!(takes_pr, GH_FACADES.len() - 1);
 }
 
 /// What `ikigai-conformance` 0.1.0 does not check (its PENDING #11): a declared
