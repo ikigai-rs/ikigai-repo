@@ -46,15 +46,20 @@
 //!
 //! No module namespace: there is no RDF face. NAMES runs: every id is kebab-case.
 //!
-//! ## The space's name
+//! ## The space's name, and the roots
 //!
-//! [`ikigai_repo::space`] is configuration-free (it reads `$IKIGAI_REPO_ROOT`,
-//! `$HOME` and the cwd per invocation, never while building), so it is declared
-//! self-named: SPACE-NAME holds it to `urn:iki:space:repo`, the same doors on
-//! every call.
+//! The walk runs on [`ikigai_repo::space_with_roots`] over the scratch base, so
+//! every `dir=` it fires lies under a configured root (ledger #1712). That space
+//! is built from what it was handed, so it is declared host-named: SPACE-NAME
+//! holds it to claiming nothing. [`ikigai_repo::space`], the closed default with
+//! no roots, is configuration-free (it reads `$IKIGAI_REPO_ROOT`, `$HOME` and
+//! the cwd per invocation, never while building), so it is declared self-named:
+//! SPACE-NAME holds it to `urn:iki:space:repo`, the same doors on every call.
 
 use ikigai_conformance::{Fixture, Report, Suite};
-use ikigai_core::{ArgRef, Capability, Error, Iri, Kernel, Representation, Request, Verb};
+use ikigai_core::{
+    ArgRef, Capability, EndpointSpace, Error, Iri, Kernel, Representation, Request, Verb,
+};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -129,8 +134,14 @@ impl Drop for Scratch {
     }
 }
 
-fn kernel() -> Kernel {
-    Kernel::new(Arc::new(ikigai_repo::space()))
+/// The space the walk and the hand-pinned tests run on: its one root is the
+/// scratch base.
+fn rooted(scratch: &Scratch) -> Arc<EndpointSpace> {
+    Arc::new(ikigai_repo::space_with_roots([&scratch.base]))
+}
+
+fn kernel(scratch: &Scratch) -> Kernel {
+    Kernel::new(rooted(scratch))
 }
 
 /// The suite, configured for this module (see the file docs for why each line):
@@ -139,6 +150,7 @@ fn kernel() -> Kernel {
 fn suite(scratch: &Scratch) -> Suite {
     let mut suite = Suite::new()
         .self_named_space("repo", ikigai_repo::space)
+        .host_named_space("space_with_roots(roots)", rooted(scratch))
         .fixture(Fixture::new("repo-list", Verb::Source).arg("root", scratch.root()));
     for id in GIT_FACADES {
         suite = suite.fixture(Fixture::new(id, Verb::Source).arg("dir", scratch.dir()));
@@ -174,7 +186,7 @@ fn assert_shape(report: &Report) {
 #[test]
 fn conforms() {
     let scratch = Scratch::new();
-    let report = suite(&scratch).run_blocking(&kernel());
+    let report = suite(&scratch).run_blocking(&kernel(&scratch));
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
@@ -208,7 +220,8 @@ fn issue(
 /// would have formed; the listing needs none.
 #[test]
 fn github_facades_are_denied_under_no_grants() {
-    let kernel = kernel();
+    let scratch = Scratch::new();
+    let kernel = kernel(&scratch);
     let none = Capability::scoped(Vec::<String>::new());
     for (id, iri) in GH_FACADES {
         let err = issue(&kernel, iri, &[("pr", "1")], &none)
@@ -224,11 +237,12 @@ fn github_facades_are_denied_under_no_grants() {
 /// (ikigai-conformance 0.8.0) would hold it to. The caller is granted
 /// `urn:cap:exec:gh`, so the kernel's gate passes and the endpoint's own parse
 /// is what answers. `dir=` names a directory that does not exist, so even a
-/// facade that stopped parsing `pr` first could not spawn `gh`: the spawn
-/// fails on the working directory and the call reaches nothing.
+/// facade that stopped parsing `pr` first could not spawn `gh`: the directory
+/// is refused before a spawn and the call reaches nothing.
 #[test]
 fn pr_facades_refuse_a_missing_pr_typed() {
-    let kernel = kernel();
+    let scratch = Scratch::new();
+    let kernel = kernel(&scratch);
     let gh = Capability::scoped(vec!["urn:cap:exec:gh".to_string()]);
     let nowhere = std::env::temp_dir().join(format!(
         "ikigai-repo-conformance-absent-{}",
@@ -263,7 +277,7 @@ fn pr_facades_refuse_a_missing_pr_typed() {
 #[test]
 fn declared_outputs_are_the_media_types_served() {
     let scratch = Scratch::new();
-    let kernel = kernel();
+    let kernel = kernel(&scratch);
     let root = Capability::root();
     let dir = scratch.dir();
     let calls: [(&str, Vec<(&str, &str)>); 5] = [
