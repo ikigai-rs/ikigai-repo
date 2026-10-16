@@ -22,9 +22,23 @@
 //! state from a closed vocabulary, a pathspec after `--`, a directory, an
 //! `owner/name`).
 //!
-//! What remains is still the platform: a facade pointed with `dir=` at a
-//! repository honors that repository's own configuration, as git and gh always
-//! do. `dir=` is not jailed to a root here.
+//! ## `dir=` is confined to the host's roots
+//! A facade pointed with `dir=` at a repository honors that repository's own
+//! configuration, as git and gh always do. So the directory is the HOST's
+//! choice, not the caller's: a host hands the space the directories it serves
+//! ([`space_with_roots`]; gonk passes its browse roots), and a `dir=` that does
+//! not resolve to a directory under one of them is refused with a typed
+//! [`Error::Denied`] before any process is spawned (ledger #1712). Both sides
+//! are canonicalized first, so a `..` or a symlink that leads out of every root
+//! is refused like any other outside path. [`space`] configures no roots, so it
+//! refuses every `dir=`: the closed default.
+//!
+//! A confined call also sets `GIT_CEILING_DIRECTORIES` to the parent of the
+//! outermost root that holds it, so git's own upward search for a repository
+//! stops at that root and never adopts a repository above it.
+//!
+//! A call WITHOUT `dir=` runs in the process's working directory, which the
+//! host chose when it started; a caller cannot move it.
 //!
 //! ## The verb tells the truth
 //! A read (`git status`, `gh pr view`) is a `Source`; a mutation (`git commit`)
@@ -41,8 +55,9 @@
 //! names, never spawning a process — so it declares and enforces
 //! `urn:cap:fs:read:*` instead of an `exec:*` scope.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use ikigai_core::{
     space_iri, ArgSpec, Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation, ReprType,
@@ -53,7 +68,58 @@ use ikigai_core::{
 /// created — the allowlist is the outer bound, the capability the inner one.
 /// Only `git` and `gh` have facades; `run` is private and every call site
 /// passes a fixed tool, so the list is a backstop, not a menu.
-const ALLOWED_TOOLS: &[&str] = &["git", "gh", "cargo", "just"];
+const ALLOWED_TOOLS: &[&str] = &["git", "gh"];
+
+/// The directories a facade may run in, as the host passed them. Shared by
+/// every facade of one space; canonicalized per call, never at construction, so
+/// building a space reads nothing.
+type Roots = Arc<[PathBuf]>;
+
+/// Where a confined call runs: the canonical directory, and the ceiling git's
+/// upward repository search must not pass.
+struct Place {
+    dir: PathBuf,
+    ceiling: Option<PathBuf>,
+}
+
+/// Confine a caller's `dir=` to `roots`, or refuse it with a typed, permanent
+/// [`Error::Denied`]. Pure path work: nothing is spawned here.
+///
+/// The directory and every root are canonicalized before they are compared, so
+/// `..` components and symlinks are resolved first and the comparison is
+/// component-wise (`/r/a` is not under `/r/ab`). A directory that does not
+/// resolve (absent, unreadable, not a directory) is refused with the same
+/// message as one outside every root, so the refusal does not say whether an
+/// outside path exists. The ceiling is the parent of the OUTERMOST root that
+/// holds the directory, so git may still find a repository at any root above it.
+fn confine(roots: &[PathBuf], dir: &str) -> Result<Place> {
+    if roots.is_empty() {
+        return Err(Error::Denied(format!(
+            "dir=`{dir}` refused: this space has no repository roots configured, so it runs \
+             in no caller-named directory; a host passes the directories it serves with \
+             ikigai_repo::space_with_roots(..)"
+        )));
+    }
+    let refused = || {
+        Error::Denied(format!(
+            "dir=`{dir}` is not a directory under a configured repository root"
+        ))
+    };
+    let target = Path::new(dir).canonicalize().map_err(|_| refused())?;
+    if !target.is_dir() {
+        return Err(refused());
+    }
+    let root = roots
+        .iter()
+        .filter_map(|root| root.canonicalize().ok())
+        .filter(|root| target.starts_with(root))
+        .min_by_key(|root| root.components().count())
+        .ok_or_else(refused)?;
+    Ok(Place {
+        ceiling: root.parent().map(Path::to_path_buf),
+        dir: target,
+    })
+}
 
 /// Listing the repositories under a ROOT reads directory names — a filesystem
 /// read. `urn:repo:list` declares and enforces this scope (the MCP `claude`
@@ -71,11 +137,19 @@ const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 /// The XSD datatype of the counted inputs (`pr`, `limit`).
 const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 
-/// Run an allowlisted tool with an argument vector in `dir`, capability-gated.
-/// Returns its stdout on success (exit 0); a missing capability is a typed,
-/// permanent [`Error::Denied`], while a non-zero exit or a spawn failure is an
-/// [`Error::Endpoint`] carrying stderr — so a caller sees *why*, as data.
-fn run(inv: &Invocation<'_>, tool: &str, args: &[String], dir: Option<&str>) -> Result<String> {
+/// Run an allowlisted tool with an argument vector in `dir`, capability-gated
+/// and confined to `roots`. Returns its stdout on success (exit 0); a missing
+/// capability or a `dir` outside every root is a typed, permanent
+/// [`Error::Denied`], while a non-zero exit or a spawn failure is an
+/// [`Error::Endpoint`] carrying stderr — so a caller sees *why*, as data. Every
+/// spawn in this crate goes through here, so every refusal comes first.
+fn run(
+    inv: &Invocation<'_>,
+    tool: &str,
+    args: &[String],
+    dir: Option<&str>,
+    roots: &[PathBuf],
+) -> Result<String> {
     if !ALLOWED_TOOLS.contains(&tool) {
         return Err(Error::Endpoint(format!(
             "exec: `{tool}` is not an allowlisted tool ({})",
@@ -90,10 +164,15 @@ fn run(inv: &Invocation<'_>, tool: &str, args: &[String], dir: Option<&str>) -> 
             "exec: capability does not grant `{scope}`"
         )));
     }
+    let place = dir.map(|dir| confine(roots, dir)).transpose()?;
     let mut command = Command::new(tool);
     command.args(args);
-    if let Some(dir) = dir {
-        command.current_dir(dir);
+    if let Some(place) = &place {
+        command.current_dir(&place.dir);
+        // gh runs git too, so the ceiling binds both tools.
+        if let Some(ceiling) = &place.ceiling {
+            command.env("GIT_CEILING_DIRECTORIES", ceiling);
+        }
     }
     let output = command
         .output()
@@ -192,21 +271,28 @@ fn json_str(s: &str) -> String {
     out
 }
 
-/// A `git`-backed read facade: builds `git -C <dir> <args…>` and runs it.
+/// The `dir` input every facade declares: a directory under the host's roots.
+fn dir_arg(summary: &str) -> ArgSpec {
+    ArgSpec::new("dir")
+        .class(XSD_STRING)
+        .summary(format!(
+            "{summary}; must lie under a repository root the host configured, else Denied"
+        ))
+        .optional()
+}
+
+/// A `git`-backed read facade: runs `git <args…>` in the confined `dir`.
 fn git_facade(
     id: &'static str,
     title: &'static str,
     summary: &'static str,
     git_args: &'static [&'static str],
+    roots: Roots,
 ) -> FnEndpoint {
     FnEndpoint::new(id, move |inv: &Invocation<'_>| {
-        let mut args: Vec<String> = Vec::new();
-        if let Ok(dir) = inv.inline_str("dir") {
-            args.push("-C".to_string());
-            args.push(dir.to_string());
-        }
-        args.extend(git_args.iter().map(|a| a.to_string()));
-        run(inv, "git", &args, None).map(text)
+        let args: Vec<String> = git_args.iter().map(|a| a.to_string()).collect();
+        let dir = inv.inline_str("dir").ok();
+        run(inv, "git", &args, dir, &roots).map(text)
     })
     .with_description(
         Description::new(id)
@@ -215,12 +301,9 @@ fn git_facade(
             .verb(Verb::Source)
             .verb(Verb::Meta)
             .requires("urn:cap:exec:git")
-            .input(
-                ArgSpec::new("dir")
-                    .class(XSD_STRING)
-                    .summary("the repository directory (defaults to the process cwd)")
-                    .optional(),
-            )
+            .input(dir_arg(
+                "the repository directory (defaults to the process cwd)",
+            ))
             .output("text/plain;charset=utf-8"),
     )
 }
@@ -235,6 +318,7 @@ fn gh_pr_facade(
     summary: &'static str,
     sub: &'static [&'static str],
     json_fields: Option<&'static str>,
+    roots: Roots,
 ) -> FnEndpoint {
     FnEndpoint::new(id, move |inv: &Invocation<'_>| {
         let pr = parse_pr(inv)?;
@@ -250,7 +334,7 @@ fn gh_pr_facade(
             args.push(repo.to_string());
         }
         let dir = inv.inline_str("dir").ok();
-        run(inv, "gh", &args, dir).map(if want_json { json } else { text })
+        run(inv, "gh", &args, dir, &roots).map(if want_json { json } else { text })
     })
     .with_description({
         let mut description = Description::new(id)
@@ -270,12 +354,7 @@ fn gh_pr_facade(
                     .summary("owner/name (else the repo at dir=/cwd)")
                     .optional(),
             )
-            .input(
-                ArgSpec::new("dir")
-                    .class(XSD_STRING)
-                    .summary("a repo directory to run in (else the process cwd)")
-                    .optional(),
-            );
+            .input(dir_arg("a repo directory to run in (else the process cwd)"));
         if let Some(fields) = json_fields {
             description = description
                 .input(
@@ -379,14 +458,14 @@ fn pr_files_args(pr: u64, want_json: bool, repo: Option<&str>) -> Vec<String> {
 /// intersect these paths with the subtree you are looking at. Default face is
 /// one path per line; `as=application/json` passes gh's export through —
 /// `{"files": [{path, additions, deletions, changeType}]}`.
-fn pr_files() -> FnEndpoint {
-    FnEndpoint::new("repo-pr-files", |inv: &Invocation<'_>| {
+fn pr_files(roots: Roots) -> FnEndpoint {
+    FnEndpoint::new("repo-pr-files", move |inv: &Invocation<'_>| {
         let pr = parse_pr(inv)?;
         let want_json = wants_json(inv);
         let repo = inv.inline_str("repo").ok();
         let args = pr_files_args(pr, want_json, repo);
         let dir = inv.inline_str("dir").ok();
-        run(inv, "gh", &args, dir).map(if want_json { json } else { text })
+        run(inv, "gh", &args, dir, &roots).map(if want_json { json } else { text })
     })
     .with_description(
         Description::new("repo-pr-files")
@@ -411,12 +490,7 @@ fn pr_files() -> FnEndpoint {
                     .summary("owner/name (else the repo at dir=/cwd)")
                     .optional(),
             )
-            .input(
-                ArgSpec::new("dir")
-                    .class(XSD_STRING)
-                    .summary("a repo directory to run in (else the process cwd)")
-                    .optional(),
-            )
+            .input(dir_arg("a repo directory to run in (else the process cwd)"))
             .input(
                 ArgSpec::new("as")
                     .class(XSD_STRING)
@@ -435,8 +509,8 @@ fn pr_files() -> FnEndpoint {
 /// drift: the default text face renders it through a gh template (one PR per
 /// line, `number⇥title⇥state⇥branch⇥updated`), `as=application/json` passes it
 /// through.
-fn pr_list() -> FnEndpoint {
-    FnEndpoint::new("repo-pr-list", |inv: &Invocation<'_>| {
+fn pr_list(roots: Roots) -> FnEndpoint {
+    FnEndpoint::new("repo-pr-list", move |inv: &Invocation<'_>| {
         let state = inv.inline_str("state").unwrap_or("open");
         if !PR_LIST_STATES.contains(&state) {
             // Refused before gh is spawned — a stray value must never become
@@ -451,7 +525,7 @@ fn pr_list() -> FnEndpoint {
         let repo = inv.inline_str("repo").ok();
         let args = pr_list_args(state, limit, want_json, repo);
         let dir = inv.inline_str("dir").ok();
-        run(inv, "gh", &args, dir).map(if want_json { json } else { text })
+        run(inv, "gh", &args, dir, &roots).map(if want_json { json } else { text })
     })
     .with_description(
         Description::new("repo-pr-list")
@@ -485,12 +559,7 @@ fn pr_list() -> FnEndpoint {
                     .summary("owner/name (else the repo at dir=/cwd)")
                     .optional(),
             )
-            .input(
-                ArgSpec::new("dir")
-                    .class(XSD_STRING)
-                    .summary("a repo directory to run in (else the process cwd)")
-                    .optional(),
-            )
+            .input(dir_arg("a repo directory to run in (else the process cwd)"))
             .input(
                 ArgSpec::new("as")
                     .class(XSD_STRING)
@@ -516,17 +585,12 @@ fn pr_list() -> FnEndpoint {
 /// path-scoped log IS the merged-PR-per-path index; extracting the numbers
 /// stays downstream (a presentation concern), this face delivers honest
 /// subjects.
-fn log() -> FnEndpoint {
-    FnEndpoint::new("repo-log", |inv: &Invocation<'_>| {
+fn log(roots: Roots) -> FnEndpoint {
+    FnEndpoint::new("repo-log", move |inv: &Invocation<'_>| {
         let limit = parse_limit(inv, 20)?;
         let path = parse_path(inv)?;
         let want_json = wants_json(inv);
-        let mut args: Vec<String> = Vec::new();
-        if let Ok(dir) = inv.inline_str("dir") {
-            args.push("-C".to_string());
-            args.push(dir.to_string());
-        }
-        args.push("log".to_string());
+        let mut args: Vec<String> = vec!["log".to_string()];
         if want_json {
             args.push("--pretty=format:%H%x1f%an%x1f%aI%x1f%s".to_string());
         } else {
@@ -539,7 +603,7 @@ fn log() -> FnEndpoint {
             args.push("--".to_string());
             args.push(path);
         }
-        let raw = run(inv, "git", &args, None)?;
+        let raw = run(inv, "git", &args, inv.inline_str("dir").ok(), &roots)?;
         if want_json {
             let entries: Vec<String> = raw
                 .lines()
@@ -586,11 +650,7 @@ fn log() -> FnEndpoint {
                     .summary("restrict to commits touching this file or subtree, relative to the repo root")
                     .optional(),
             )
-            .input(
-                ArgSpec::new("dir").class(XSD_STRING)
-                    .summary("the repository directory (defaults to the process cwd)")
-                    .optional(),
-            )
+            .input(dir_arg("the repository directory (defaults to the process cwd)"))
             .input(
                 ArgSpec::new("as").class(XSD_STRING)
                     .summary("application/json for the structured face")
@@ -698,14 +758,69 @@ fn list() -> FnEndpoint {
 /// The name [`space`] claims: `urn:iki:space:repo`.
 pub const SPACE_ID: &str = "urn:iki:space:repo";
 
-/// The dev-tooling space: the typed read facades and the repository listing.
-/// It serves no low-level exec: `urn:system:exec` is not bound, so the kernel
-/// answers it `Unresolved` (ledger #1706).
+/// The dev-tooling space with NO repository roots: the closed default.
+///
+/// Every `dir=` is refused with a typed [`Error::Denied`] that names
+/// [`space_with_roots`]; a call without `dir=` still runs in the process's
+/// working directory, and `urn:repo:list` is unaffected. It serves no low-level
+/// exec: `urn:system:exec` is not bound, so the kernel answers it `Unresolved`
+/// (ledger #1706).
 ///
 /// Configuration-free, so it names itself [`SPACE_ID`]: building it reads
 /// nothing. `$IKIGAI_REPO_ROOT`, `$HOME`, the process cwd and the tools on
 /// `PATH` are read per invocation, never here.
 pub fn space() -> EndpointSpace {
+    // Named last: a later `bind` drops the name (core 0.1.89).
+    bind(Arc::from(Vec::new())).named(space_iri("repo"))
+}
+
+/// The dev-tooling space whose facades run in any directory under `roots`
+/// (ledger #1712): the directories the host serves, such as gonk's browse roots.
+/// A `dir=` resolving outside all of them, by a plain path, a `..` or a
+/// symlink, is refused with a typed [`Error::Denied`] before a process is
+/// spawned. An empty `roots` refuses every `dir=`, as [`space`] does.
+///
+/// Roots are canonicalized on each call, not here, so building the space reads
+/// nothing and a root created later is honored. A root that does not resolve
+/// matches nothing.
+///
+/// Built from what the host passed, so it claims no name: the host names it
+/// (core's rule for instance-built spaces, ledger #987).
+///
+/// ```
+/// use ikigai_core::{ArgRef, Capability, Error, Iri, Kernel, Request, Space, Verb};
+/// use std::sync::Arc;
+///
+/// let root = std::env::temp_dir().join(format!("ikigai-repo-doc-{}", std::process::id()));
+/// std::fs::create_dir_all(&root).unwrap();
+/// let space = ikigai_repo::space_with_roots([&root]);
+/// assert!(space.id().is_none(), "the host names an instance-built space");
+///
+/// // A directory outside the root is refused before git is spawned.
+/// let kernel = Kernel::new(Arc::new(space));
+/// let outside = root.parent().unwrap().to_str().unwrap().as_bytes().to_vec();
+/// let request = Request::new(Verb::Source, Iri::parse("urn:repo:status").unwrap())
+///     .with_arg("dir", ArgRef::Inline(outside));
+/// let capability = Capability::scoped(["urn:cap:exec:git"]);
+/// let err = futures::executor::block_on(kernel.issue(request, &capability)).unwrap_err();
+/// assert!(matches!(err, Error::Denied(_)), "{err:?}");
+/// std::fs::remove_dir_all(&root).ok();
+/// ```
+pub fn space_with_roots<I, P>(roots: I) -> EndpointSpace
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
+    let roots: Vec<PathBuf> = roots
+        .into_iter()
+        .map(|root| root.as_ref().to_path_buf())
+        .collect();
+    bind(Arc::from(roots))
+}
+
+/// Bind every endpoint over one shared set of roots. Unnamed: [`space`] names
+/// its result, a host names [`space_with_roots`]'s.
+fn bind(roots: Roots) -> EndpointSpace {
     EndpointSpace::new()
         .bind(
             Exact::new("urn:repo:status"),
@@ -714,9 +829,10 @@ pub fn space() -> EndpointSpace {
                 "Repository status",
                 "The working tree's status, machine-readable (git status --porcelain=v1 -b).",
                 &["status", "--porcelain=v1", "-b"],
+                roots.clone(),
             ),
         )
-        .bind(Exact::new("urn:repo:log"), log())
+        .bind(Exact::new("urn:repo:log"), log(roots.clone()))
         .bind(
             Exact::new("urn:repo:branch"),
             git_facade(
@@ -724,6 +840,7 @@ pub fn space() -> EndpointSpace {
                 "Current branch",
                 "The current branch name (git branch --show-current).",
                 &["branch", "--show-current"],
+                roots.clone(),
             ),
         )
         .bind(Exact::new("urn:repo:list"), list())
@@ -737,6 +854,7 @@ pub fn space() -> EndpointSpace {
                  (host-side, time transport) is what removes the wait from an agent's loop.",
                 &["pr", "checks"],
                 None,
+                roots.clone(),
             ),
         )
         .bind(
@@ -749,10 +867,11 @@ pub fn space() -> EndpointSpace {
                  the PR head commit sha a review archive keys on.",
                 &["pr", "view"],
                 Some(PR_VIEW_JSON_FIELDS),
+                roots.clone(),
             ),
         )
-        .bind(Exact::new("urn:repo:pr:list"), pr_list())
-        .bind(Exact::new("urn:repo:pr:files"), pr_files())
+        .bind(Exact::new("urn:repo:pr:list"), pr_list(roots.clone()))
+        .bind(Exact::new("urn:repo:pr:files"), pr_files(roots.clone()))
         .bind(
             Exact::new("urn:repo:pr:diff"),
             gh_pr_facade(
@@ -763,10 +882,9 @@ pub fn space() -> EndpointSpace {
                  head sha the diff corresponds to.",
                 &["pr", "diff"],
                 None,
+                roots,
             ),
         )
-        // Last: a later `bind` drops the name (core 0.1.89).
-        .named(space_iri("repo"))
 }
 
 #[cfg(test)]
@@ -781,11 +899,35 @@ mod tests {
     }
 
     fn source(iri: &str, args: &[(&str, &str)], cap: &Capability) -> Result<Representation> {
+        issue_on(&kernel(), iri, args, cap)
+    }
+
+    /// Issue a Source on a kernel over [`space_with_roots`]`(roots)`.
+    fn source_under(
+        roots: &[&std::path::Path],
+        iri: &str,
+        args: &[(&str, &str)],
+        cap: &Capability,
+    ) -> Result<Representation> {
+        let kernel = Kernel::new(Arc::new(space_with_roots(roots)));
+        issue_on(&kernel, iri, args, cap)
+    }
+
+    fn issue_on(
+        kernel: &Kernel,
+        iri: &str,
+        args: &[(&str, &str)],
+        cap: &Capability,
+    ) -> Result<Representation> {
         let mut request = Request::new(Verb::Source, Iri::parse(iri).unwrap());
         for (k, v) in args {
             request = request.with_arg(*k, ArgRef::Inline(v.as_bytes().to_vec()));
         }
-        block_on(kernel().issue(request, cap))
+        block_on(kernel.issue(request, cap))
+    }
+
+    fn no_roots() -> Roots {
+        Arc::from(Vec::new())
     }
 
     /// The space serves no low-level exec (ledger #1706): `urn:system:exec` is
@@ -818,7 +960,7 @@ mod tests {
     ) -> Result<Representation> {
         let probe = FnEndpoint::new("run-probe", move |inv: &Invocation<'_>| {
             let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-            run(inv, tool, &args, None).map(text)
+            run(inv, tool, &args, None, &[]).map(text)
         });
         let kernel = Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:test:run"), probe),
@@ -854,6 +996,17 @@ mod tests {
             "{err:?}"
         );
 
+        // cargo and just have no facade, so they are off the list too (ledger
+        // #1712): a `--version` that would succeed is refused under the grant.
+        for tool in ["cargo", "just"] {
+            let cap = Capability::scoped([format!("urn:cap:exec:{tool}")]);
+            let err = run_fixed(tool, &["--version"], &cap).unwrap_err();
+            assert!(
+                format!("{err:?}").contains("not an allowlisted tool"),
+                "{tool}: {err:?}"
+            );
+        }
+
         // git --version under the git grant → runs, stdout carries "git version".
         let git = Capability::scoped(["urn:cap:exec:git"]);
         let out = run_fixed("git", &["--version"], &git).unwrap();
@@ -862,6 +1015,260 @@ mod tests {
             "{:?}",
             String::from_utf8_lossy(&out.bytes)
         );
+    }
+
+    /// A fresh, empty base directory for one confinement test, removed on drop.
+    struct Base(std::path::PathBuf);
+
+    impl Base {
+        fn new(name: &str) -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "ikigai-repo-{name}-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Base(path)
+        }
+
+        /// A plain directory under the base.
+        fn dir(&self, rel: &str) -> std::path::PathBuf {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(&path).unwrap();
+            path
+        }
+
+        /// A hermetic git repository with one commit under the base: a place
+        /// where `git status` WOULD answer, so only a refusal keeps it from
+        /// answering.
+        fn repo(&self, rel: &str) -> std::path::PathBuf {
+            let path = self.dir(rel);
+            for args in [
+                &["init", "-q"][..],
+                &["commit", "-q", "--allow-empty", "-m", "scratch"][..],
+            ] {
+                let out = Command::new("git")
+                    .arg("-C")
+                    .arg(&path)
+                    .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "git {args:?}: {out:?}");
+            }
+            path
+        }
+    }
+
+    impl Drop for Base {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn git_cap() -> Capability {
+        Capability::scoped(["urn:cap:exec:git"])
+    }
+
+    fn assert_denied(result: Result<Representation>, what: &str) {
+        let err = result.err().unwrap_or_else(|| panic!("{what}: answered"));
+        assert!(matches!(err, Error::Denied(_)), "{what}: {err:?}");
+        assert!(!err.is_transient(), "{what}: {err:?}");
+    }
+
+    /// The three git facades, each with the minimal arguments it runs on.
+    const GIT_IRIS: [&str; 3] = ["urn:repo:status", "urn:repo:branch", "urn:repo:log"];
+
+    /// In a root, the facades run: the root itself and a repository below it.
+    #[test]
+    fn a_dir_under_a_root_runs() {
+        let base = Base::new("in-root");
+        let root = base.dir("root");
+        let repo = base.repo("root/repo");
+        let held = base.repo("held");
+        for iri in GIT_IRIS {
+            let out = source_under(
+                &[&root],
+                iri,
+                &[("dir", repo.to_str().unwrap())],
+                &git_cap(),
+            );
+            assert!(out.is_ok(), "{iri}: {out:?}");
+            // A root that is itself a repository is in its own jail.
+            let out = source_under(
+                &[&held],
+                iri,
+                &[("dir", held.to_str().unwrap())],
+                &git_cap(),
+            );
+            assert!(out.is_ok(), "{iri}: {out:?}");
+        }
+        let out = source_under(
+            &[&root],
+            "urn:repo:status",
+            &[("dir", repo.to_str().unwrap())],
+            &git_cap(),
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8_lossy(&out.bytes).starts_with("## "),
+            "{out:?}"
+        );
+    }
+
+    /// A real repository outside every root is refused, typed, by every facade
+    /// that takes `dir=`: git would answer there, so an answer would be a spawn.
+    /// The gh facades refuse before gh is spawned, so this reaches no network.
+    #[test]
+    fn a_dir_outside_every_root_is_refused_before_spawning() {
+        let base = Base::new("out-root");
+        let root = base.dir("root");
+        let outside = base.repo("outside");
+        let dir = outside.to_str().unwrap();
+        for iri in GIT_IRIS {
+            assert_denied(
+                source_under(&[&root], iri, &[("dir", dir)], &git_cap()),
+                iri,
+            );
+        }
+        let gh = Capability::scoped(["urn:cap:exec:gh"]);
+        for iri in [
+            "urn:repo:pr:list",
+            "urn:repo:pr:view",
+            "urn:repo:pr:files",
+            "urn:repo:pr:diff",
+            "urn:repo:pr:checks",
+        ] {
+            assert_denied(
+                source_under(&[&root], iri, &[("dir", dir), ("pr", "1")], &gh),
+                iri,
+            );
+        }
+        // Prefixes compare by component: `root-2` is not under `root`.
+        let sibling = base.repo("root-2");
+        assert_denied(
+            source_under(
+                &[&root],
+                "urn:repo:status",
+                &[("dir", sibling.to_str().unwrap())],
+                &git_cap(),
+            ),
+            "a sibling sharing the root's name as a string prefix",
+        );
+        // An absent directory is refused the same way, so the refusal does not
+        // say whether an outside path exists.
+        let absent = root.join("absent");
+        assert_denied(
+            source_under(
+                &[&root],
+                "urn:repo:status",
+                &[("dir", absent.to_str().unwrap())],
+                &git_cap(),
+            ),
+            "an absent directory",
+        );
+    }
+
+    /// A `..` that climbs out of the root is resolved before the comparison.
+    #[test]
+    fn a_dotdot_escape_is_refused() {
+        let base = Base::new("dotdot");
+        let root = base.dir("root");
+        base.repo("outside");
+        base.dir("root/sub");
+        for escape in ["root/../outside", "root/sub/../../outside"] {
+            let dir = base.0.join(escape);
+            assert_denied(
+                source_under(
+                    &[&root],
+                    "urn:repo:status",
+                    &[("dir", dir.to_str().unwrap())],
+                    &git_cap(),
+                ),
+                escape,
+            );
+        }
+    }
+
+    /// A symlink inside the root that points out of it is resolved first; a
+    /// root named through a symlink still holds what it points at.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_escape_is_refused() {
+        let base = Base::new("symlink");
+        let root = base.dir("root");
+        let outside = base.repo("outside");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert_denied(
+            source_under(
+                &[&root],
+                "urn:repo:status",
+                &[("dir", link.to_str().unwrap())],
+                &git_cap(),
+            ),
+            "a symlink out of the root",
+        );
+
+        let repo = base.repo("root/repo");
+        let root_link = base.0.join("root-link");
+        std::os::unix::fs::symlink(&root, &root_link).unwrap();
+        let out = source_under(
+            &[&root_link],
+            "urn:repo:status",
+            &[("dir", repo.to_str().unwrap())],
+            &git_cap(),
+        );
+        assert!(out.is_ok(), "{out:?}");
+    }
+
+    /// No roots configured: every `dir=` is refused, and the refusal names how
+    /// a host configures them. A call without `dir=` is the host's own cwd and
+    /// still runs (see `a_facade_declares_its_capability_and_reads_this_repo`).
+    #[test]
+    fn no_roots_refuses_every_dir() {
+        let base = Base::new("no-roots");
+        let repo = base.repo("repo");
+        let dir = repo.to_str().unwrap();
+        for iri in GIT_IRIS {
+            let err = source(iri, &[("dir", dir)], &git_cap()).unwrap_err();
+            assert!(matches!(err, Error::Denied(_)), "{iri}: {err:?}");
+            assert!(
+                format!("{err}").contains("space_with_roots"),
+                "{iri}: {err}"
+            );
+            let none: [&std::path::Path; 0] = [];
+            assert_denied(source_under(&none, iri, &[("dir", dir)], &git_cap()), iri);
+        }
+    }
+
+    /// git's upward search for a repository stops at the root: a plain
+    /// directory configured as a root, inside a repository, is not a repository.
+    #[test]
+    fn git_does_not_search_above_the_root() {
+        let base = Base::new("ceiling");
+        base.repo("outer");
+        let root = base.dir("outer/inner");
+        // Without the ceiling, git would find `outer` from `inner`.
+        let probe = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .unwrap();
+        assert!(probe.status.success(), "{probe:?}");
+        let err = source_under(
+            &[&root],
+            "urn:repo:status",
+            &[("dir", root.to_str().unwrap())],
+            &git_cap(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Endpoint(_)), "{err:?}");
+        assert!(format!("{err}").contains("not a git repository"), "{err}");
     }
 
     #[test]
@@ -993,7 +1400,7 @@ mod tests {
         use ikigai_core::Endpoint;
 
         // pr:list: exec:gh, limit default 30 (xsd:integer), a json face, both outputs.
-        let d = pr_list().describe();
+        let d = pr_list(no_roots()).describe();
         assert!(d.requires.contains(&"urn:cap:exec:gh".to_string()), "{d:?}");
         let limit = d.inputs.iter().find(|a| a.name == "limit").unwrap();
         assert_eq!(limit.default.as_deref(), Some("30"));
@@ -1023,6 +1430,7 @@ mod tests {
             "s",
             &["pr", "view"],
             Some(PR_VIEW_JSON_FIELDS),
+            no_roots(),
         )
         .describe();
         let face = d.inputs.iter().find(|a| a.name == "as").unwrap();
@@ -1030,13 +1438,14 @@ mod tests {
         assert!(d.outputs.iter().any(|o| o == "application/json"), "{d:?}");
 
         // pr:diff: text-only (no as= arg, one output), pr= required.
-        let d = gh_pr_facade("repo-pr-diff", "t", "s", &["pr", "diff"], None).describe();
+        let d =
+            gh_pr_facade("repo-pr-diff", "t", "s", &["pr", "diff"], None, no_roots()).describe();
         assert!(d.inputs.iter().all(|a| a.name != "as"), "{d:?}");
         assert_eq!(d.outputs, vec!["text/plain;charset=utf-8".to_string()]);
         assert!(d.inputs.iter().find(|a| a.name == "pr").unwrap().required);
 
         // log: exec:git, limit default 20, both faces, path= optional.
-        let d = log().describe();
+        let d = log(no_roots()).describe();
         assert!(
             d.requires.contains(&"urn:cap:exec:git".to_string()),
             "{d:?}"
@@ -1048,7 +1457,7 @@ mod tests {
         assert!(!path.required, "{path:?}");
 
         // pr:files: exec:gh, pr= required (xsd:integer), a json face, both outputs.
-        let d = pr_files().describe();
+        let d = pr_files(no_roots()).describe();
         assert!(d.requires.contains(&"urn:cap:exec:gh".to_string()), "{d:?}");
         let pr = d.inputs.iter().find(|a| a.name == "pr").unwrap();
         assert!(pr.required, "{pr:?}");
@@ -1093,14 +1502,21 @@ mod tests {
         let git = Capability::scoped(["urn:cap:exec:git"]);
 
         // Default face: oneline, limit honored.
-        let out = source("urn:repo:log", &[("limit", "2"), ("dir", dir)], &git).unwrap();
+        let out = source_under(
+            &[&base],
+            "urn:repo:log",
+            &[("limit", "2"), ("dir", dir)],
+            &git,
+        )
+        .unwrap();
         assert!(out.repr_type.media_type.starts_with("text/plain"));
         let body = String::from_utf8_lossy(&out.bytes).into_owned();
         assert_eq!(body.lines().count(), 2, "{body:?}");
         assert!(body.lines().next().unwrap().contains("third"), "{body:?}");
 
         // JSON face: [{hash, author, date, subject}], full sha, RFC 3339 date.
-        let out = source(
+        let out = source_under(
+            &[&base],
             "urn:repo:log",
             &[("limit", "2"), ("dir", dir), ("as", "application/json")],
             &git,
@@ -1124,7 +1540,7 @@ mod tests {
         assert!(body.contains("second \\\"quoted\\\""), "{body:?}");
 
         // A non-numeric limit is refused before git runs.
-        let err = source("urn:repo:log", &[("limit", "1; rm")], &git).unwrap_err();
+        let err = source_under(&[&base], "urn:repo:log", &[("limit", "1; rm")], &git).unwrap_err();
         assert!(
             format!("{err:?}").contains("limit must be a number"),
             "{err:?}"
@@ -1165,14 +1581,21 @@ mod tests {
         let git = Capability::scoped(["urn:cap:exec:git"]);
 
         // path= narrows the text face to the commits that touched the subtree.
-        let out = source("urn:repo:log", &[("dir", dir), ("path", "sub")], &git).unwrap();
+        let out = source_under(
+            &[&base],
+            "urn:repo:log",
+            &[("dir", dir), ("path", "sub")],
+            &git,
+        )
+        .unwrap();
         let body = String::from_utf8_lossy(&out.bytes).into_owned();
         assert_eq!(body.lines().count(), 1, "{body:?}");
         assert!(body.contains("touch sub (#2)"), "{body:?}");
 
         // …and composes with limit=: two a-touching commits, newest first,
         // limit=1 keeps only the newest.
-        let out = source(
+        let out = source_under(
+            &[&base],
             "urn:repo:log",
             &[("dir", dir), ("path", "a.txt"), ("limit", "1")],
             &git,
@@ -1183,7 +1606,8 @@ mod tests {
         assert!(body.contains("touch a again (#3)"), "{body:?}");
 
         // The JSON face takes the same pathspec: honest subjects, same scope.
-        let out = source(
+        let out = source_under(
+            &[&base],
             "urn:repo:log",
             &[("dir", dir), ("path", "a.txt"), ("as", "application/json")],
             &git,
@@ -1197,13 +1621,25 @@ mod tests {
 
         // A path that looks like a flag is refused before git runs — it could
         // never act as one (it rides after `--`), but silence would be worse.
-        let err = source("urn:repo:log", &[("dir", dir), ("path", "--all")], &git).unwrap_err();
+        let err = source_under(
+            &[&base],
+            "urn:repo:log",
+            &[("dir", dir), ("path", "--all")],
+            &git,
+        )
+        .unwrap_err();
         assert!(
             format!("{err:?}").contains("path must be a pathspec"),
             "{err:?}"
         );
         // The empty pathspec is refused with our error, not git's fatal.
-        let err = source("urn:repo:log", &[("dir", dir), ("path", "")], &git).unwrap_err();
+        let err = source_under(
+            &[&base],
+            "urn:repo:log",
+            &[("dir", dir), ("path", "")],
+            &git,
+        )
+        .unwrap_err();
         assert!(
             format!("{err:?}").contains("path must not be empty"),
             "{err:?}"
