@@ -1,15 +1,15 @@
 # ikigai-repo
 
-Git, `gh`, and `cargo` as [ikigai](https://github.com/ikigai-rs) resources — the
+Git and `gh` as [ikigai](https://github.com/ikigai-rs) resources — the
 **platform seam** for development tooling.
 
-A capability-gated **exec** endpoint runs an *allowlisted* tool with an
-**argument vector** (never a shell string, so there is no injection surface),
-and typed **facades** sit over it:
+Typed, capability-gated **facades**, each of which builds a fixed argument
+vector for `git` or `gh`; a caller supplies only typed values (a number, a state
+from a closed vocabulary, a pathspec, a directory, an `owner/name`), never the
+argv. There is **no low-level exec endpoint** (see [Changes](#changes)):
 
 | resource | what it is |
 |----------|------------|
-| `urn:system:exec` | run an allowlisted tool (`git`/`gh`/`cargo`/`just`) with `tool=` + `args=` (one arg per line) + `dir=`; gated on `urn:cap:exec:{tool}` |
 | `urn:repo:status` | the working tree's status (`git status --porcelain=v1 -b`) |
 | `urn:repo:log` | recent history (`git log --oneline`, `limit=` commits, default 20); `path=` restricts to commits touching a file/subtree (`git log -- <path>`) — under squash-merge style, the merged-PR-per-path index; `as=application/json` → `[{hash, author, date, subject}]` (full sha, RFC 3339 date) |
 | `urn:repo:branch` | the current branch |
@@ -23,11 +23,13 @@ and typed **facades** sit over it:
 The `pr:*` facades take `pr=` (the number) plus optional `repo=` (`owner/name`)
 or `dir=` (a repo directory to run in); they require `urn:cap:exec:gh`.
 
-Two layers gate every call: the **allowlist** (the outer bound — an unknown tool
-is refused before a process is spawned) and the **capability** (the inner bound —
-`urn:system:exec` requires `urn:cap:exec:{tool}`; each facade declares the
-concrete scope it needs). The manifold offers exec under the wildcard
-`urn:cap:exec:*`, so an agent only ever sees it under an exec grant.
+Each facade declares and enforces the concrete capability it needs:
+`urn:cap:exec:git` for `status`/`log`/`branch`, `urn:cap:exec:gh` for the
+`pr:*` family. Those grants gate only these facades: holding
+`urn:cap:exec:git` does not let a caller choose what git runs.
+
+A facade pointed with `dir=` at a repository honors that repository's own
+configuration, as git and gh always do; `dir=` is not confined to a root.
 
 **The verb tells the truth**: a read (`git status`) is a `Source`; a mutation
 (`git commit`) is a `Sink` under a write capability. v1 ships the read facades.
@@ -60,6 +62,23 @@ module cannot see from an absolute `dir=` — so every representation is live.
 The `urn:repo:pr:*` facades are opted out of the checks that fire them
 ("reaches api.github.com"); the static checks still hold them, and their
 capability gate is pinned by a test of its own.
+
+## Changes
+
+**Unreleased (rides the next release):** `urn:system:exec` is no longer served
+(ledger #1706). It took a caller's argument vector (`tool=` + `args=` + `dir=`)
+gated only by a tool allowlist and `urn:cap:exec:{tool}`, and an argv is not a
+safe boundary for these tools: git, gh, cargo and just each have flags and
+configuration that run other programs, so a per-tool grant was a grant to run
+anything. The space now answers that name `Unresolved`.
+
+- **Consumers lose the `system-exec` tool at their next bump of this crate**:
+  gonk, and the cli's MCP projection (which projects every endpoint the space
+  binds), stop offering it. Nothing outside this crate called it.
+- **The per-tool exec grants (`urn:cap:exec:git`, `urn:cap:exec:gh`,
+  `urn:cap:exec:cargo`) now gate only the typed `urn:repo:*` facades.** No facade
+  runs cargo or just, so `urn:cap:exec:cargo` gates nothing here.
+- The facades are unchanged: same names, arguments, faces and capabilities.
 
 ## License
 Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT).

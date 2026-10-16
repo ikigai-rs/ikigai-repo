@@ -1,4 +1,4 @@
-//! The module recipe as one test: `ikigai-conformance` walks the ten endpoints
+//! The module recipe as one test: `ikigai-conformance` walks the nine endpoints
 //! [`ikigai_repo::space`] binds and reports every violation at once.
 //!
 //! ## Nothing here is pure, and nothing is cached
@@ -22,8 +22,7 @@
 //! enclosing repository. [`Scratch`] builds a fresh `git init` with one commit
 //! under a hermetic identity, inside a base directory that doubles as the ROOT
 //! `urn:repo:list` scans (so the listing finds exactly that one repo). Every
-//! git-backed action takes `dir=` pointing at it; `urn:system:exec` runs
-//! `git rev-parse HEAD` there.
+//! git-backed action takes `dir=` pointing at it.
 //!
 //! ## The GitHub facades are opted out — and their enforcement pinned by hand
 //!
@@ -40,11 +39,10 @@
 //!
 //! ## REQUIRED on the fired actions
 //!
-//! Of the five actions the walk fires, one input is declared required with no
-//! default: `urn:system:exec`'s `tool`. REQUIRED drops it from the fixture call
-//! and holds the refusal to a typed `MissingArgument`, which spawns nothing.
-//! (Checked when adopting 0.8.0: an exec that defaulted `tool` turned this test
-//! red with a REQUIRED finding.) Every other fired input is optional.
+//! Of the four actions the walk fires, none declares a required input: every
+//! fired input is optional. (The retired `urn:system:exec` carried the one that
+//! did, its `tool`; the space no longer serves it, ledger #1706.) REQUIRED is
+//! held on the `pr` facades by [`pr_facades_refuse_a_missing_pr_typed`].
 //!
 //! No module namespace: there is no RDF face. NAMES runs: every id is kebab-case.
 //!
@@ -78,10 +76,10 @@ const GH_FACADES: [(&str, &str); 5] = [
 /// them, which CI cannot do and which is never a fixture.
 const REACHES_GITHUB: &str = "reaches api.github.com";
 
-/// Every endpoint `space()` binds: the exec seam, the listing, the git facades,
-/// the GitHub facades. Each declares exactly one action (Source; Meta is the
-/// kernel's).
-const ENDPOINTS: usize = 2 + GIT_FACADES.len() + GH_FACADES.len();
+/// Every endpoint `space()` binds: the listing, the git facades, the GitHub
+/// facades. Each declares exactly one action (Source; Meta is the kernel's).
+/// There is no low-level exec among them (ledger #1706).
+const ENDPOINTS: usize = 1 + GIT_FACADES.len() + GH_FACADES.len();
 
 /// A hermetic scratch repository under a fresh base directory, removed on drop.
 struct Scratch {
@@ -141,12 +139,6 @@ fn kernel() -> Kernel {
 fn suite(scratch: &Scratch) -> Suite {
     let mut suite = Suite::new()
         .self_named_space("repo", ikigai_repo::space)
-        .fixture(
-            Fixture::new("system-exec", Verb::Source)
-                .arg("tool", "git")
-                .arg("args", "rev-parse\nHEAD")
-                .arg("dir", scratch.dir()),
-        )
         .fixture(Fixture::new("repo-list", Verb::Source).arg("root", scratch.root()));
     for id in GIT_FACADES {
         suite = suite.fixture(Fixture::new(id, Verb::Source).arg("dir", scratch.dir()));
@@ -158,7 +150,7 @@ fn suite(scratch: &Scratch) -> Suite {
 }
 
 /// The walk saw every endpoint, one Source action each, skipped no check, and
-/// opted out exactly the GitHub facades. An eleventh endpoint bound without a
+/// opted out exactly the GitHub facades. A tenth endpoint bound without a
 /// line here is held to a weaker standard; a listed id that binds nothing is a
 /// stale list.
 fn assert_shape(report: &Report) {
@@ -274,11 +266,7 @@ fn declared_outputs_are_the_media_types_served() {
     let kernel = kernel();
     let root = Capability::root();
     let dir = scratch.dir();
-    let calls: [(&str, Vec<(&str, &str)>); 6] = [
-        (
-            "urn:system:exec",
-            vec![("tool", "git"), ("args", "rev-parse\nHEAD"), ("dir", dir)],
-        ),
+    let calls: [(&str, Vec<(&str, &str)>); 5] = [
         ("urn:repo:status", vec![("dir", dir)]),
         ("urn:repo:branch", vec![("dir", dir)]),
         ("urn:repo:list", vec![("root", scratch.root())]),
