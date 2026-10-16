@@ -1,27 +1,41 @@
-//! Git, `gh`, and `cargo` as ikigai resources.
+//! Git and `gh` as ikigai resources.
 //!
-//! This module is the **platform seam** for development tooling: a
-//! capability-gated [`exec`](self) endpoint that runs an *allowlisted* external
-//! tool with an **argument vector** (never a shell string — nothing is ever
-//! interpolated into a shell, so there is no injection surface), and a set of
-//! **typed facades** over it (`urn:repo:status`, `:log`, `:branch`, and the
-//! `urn:repo:pr:*` family: `:list`, `:view`, `:files`, `:diff`, `:checks`) that build
-//! the right invocation and speak the ikigai self-description. A companion
-//! `urn:repo:list` enumerates the repositories under a ROOT so an agent whose
-//! cwd is not a repo (e.g. `ikigai mcp`) can discover where to point `dir=`.
+//! This module is the **platform seam** for development tooling: a set of
+//! **typed facades** (`urn:repo:status`, `:log`, `:branch`, and the
+//! `urn:repo:pr:*` family: `:list`, `:view`, `:files`, `:diff`, `:checks`), each
+//! of which builds a FIXED argument vector for `git` or `gh` and speaks the
+//! ikigai self-description. A companion `urn:repo:list` enumerates the
+//! repositories under a ROOT so an agent whose cwd is not a repo (e.g.
+//! `ikigai mcp`) can discover where to point `dir=`.
 //!
 //! Native-only by nature (it spawns subprocesses), so it carries no wasm face —
 //! it is to the shell what `ikigai-personal` is to EventKit.
 //!
+//! ## No low-level exec is served
+//! The space binds no endpoint that takes a caller's argument vector. An earlier
+//! `urn:system:exec` did (`tool=` + `args=` + `dir=`, gated only by a tool
+//! allowlist and `urn:cap:exec:{tool}`), and an argv is not a safe boundary for
+//! these tools: git, gh, cargo and just each have flags and configuration that
+//! run other programs, so a per-tool grant over a caller-built argv was a grant
+//! to run anything (ledger #1706). The facades are the only seam: each fixes the
+//! subcommand and flags, and its caller supplies only typed values (a number, a
+//! state from a closed vocabulary, a pathspec after `--`, a directory, an
+//! `owner/name`).
+//!
+//! What remains is still the platform: a facade pointed with `dir=` at a
+//! repository honors that repository's own configuration, as git and gh always
+//! do. `dir=` is not jailed to a root here.
+//!
 //! ## The verb tells the truth
 //! A read (`git status`, `gh pr view`) is a `Source`; a mutation (`git commit`)
-//! would be a `Sink` under a write capability. v1 ships the read facades; the
-//! low-level `urn:system:exec` runs whatever allowlisted read the caller builds.
+//! would be a `Sink` under a write capability. v1 ships the read facades only.
 //!
 //! ## Capabilities
-//! `urn:system:exec` requires `urn:cap:exec:{tool}` (e.g. `urn:cap:exec:git`);
-//! the manifold offers it under the wildcard `urn:cap:exec:*`. Each facade
-//! declares the concrete capability it needs. No grant, no tool.
+//! Each facade declares and enforces the concrete capability it needs:
+//! `urn:cap:exec:git` for the git facades, `urn:cap:exec:gh` for the
+//! `urn:repo:pr:*` family. Those grants now gate only these facades; holding
+//! `urn:cap:exec:git` does not let a caller choose what git runs. No grant, no
+//! tool.
 //!
 //! `urn:repo:list` is a filesystem read, not an exec — it enumerates directory
 //! names, never spawning a process — so it declares and enforces
@@ -35,9 +49,10 @@ use ikigai_core::{
     Representation, Result, Verb,
 };
 
-/// The tools `urn:system:exec` will spawn. Anything else is refused before a
-/// process is created — the allowlist is the outer bound, the capability the
-/// inner one.
+/// The tools [`run`] will spawn. Anything else is refused before a process is
+/// created — the allowlist is the outer bound, the capability the inner one.
+/// Only `git` and `gh` have facades; `run` is private and every call site
+/// passes a fixed tool, so the list is a backstop, not a menu.
 const ALLOWED_TOOLS: &[&str] = &["git", "gh", "cargo", "just"];
 
 /// Listing the repositories under a ROOT reads directory names — a filesystem
@@ -175,56 +190,6 @@ fn json_str(s: &str) -> String {
     }
     out.push('"');
     out
-}
-
-/// `urn:system:exec` — the low-level seam. `tool=` (allowlisted) + `args=`
-/// (newline-separated argument vector) + optional `dir=`.
-fn exec() -> FnEndpoint {
-    FnEndpoint::new("system-exec", |inv: &Invocation<'_>| {
-        let tool = inv
-            .inline_str("tool")
-            .map_err(|_| Error::MissingArgument("tool (git, gh, cargo, just)".to_string()))?;
-        let args: Vec<String> = inv
-            .inline_str("args")
-            .unwrap_or("")
-            .split('\n')
-            .filter(|a| !a.is_empty())
-            .map(str::to_string)
-            .collect();
-        let dir = inv.inline_str("dir").ok();
-        run(inv, tool, &args, dir).map(text)
-    })
-    .with_description(
-        Description::new("system-exec")
-            .title("Run an allowlisted dev tool")
-            .summary(
-                "Spawn an allowlisted external tool (git, gh, cargo, just) with an argument \
-                 vector — never a shell string, so no injection surface. Capability-gated per \
-                 tool (urn:cap:exec:{tool}). The typed urn:repo:* facades build the invocation.",
-            )
-            .verb(Verb::Source)
-            .verb(Verb::Meta)
-            .requires("urn:cap:exec:*")
-            .input(
-                ArgSpec::new("tool")
-                    .class(XSD_STRING)
-                    .summary("the tool to run")
-                    .one_of(ALLOWED_TOOLS.iter().copied()),
-            )
-            .input(
-                ArgSpec::new("args")
-                    .class(XSD_STRING)
-                    .summary("the argument vector, one argument per line")
-                    .optional(),
-            )
-            .input(
-                ArgSpec::new("dir")
-                    .class(XSD_STRING)
-                    .summary("working directory (defaults to the process cwd)")
-                    .optional(),
-            )
-            .output("text/plain;charset=utf-8"),
-    )
 }
 
 /// A `git`-backed read facade: builds `git -C <dir> <args…>` and runs it.
@@ -733,14 +698,15 @@ fn list() -> FnEndpoint {
 /// The name [`space`] claims: `urn:iki:space:repo`.
 pub const SPACE_ID: &str = "urn:iki:space:repo";
 
-/// The dev-tooling space: the exec seam + the read facades.
+/// The dev-tooling space: the typed read facades and the repository listing.
+/// It serves no low-level exec: `urn:system:exec` is not bound, so the kernel
+/// answers it `Unresolved` (ledger #1706).
 ///
 /// Configuration-free, so it names itself [`SPACE_ID`]: building it reads
 /// nothing. `$IKIGAI_REPO_ROOT`, `$HOME`, the process cwd and the tools on
 /// `PATH` are read per invocation, never here.
 pub fn space() -> EndpointSpace {
     EndpointSpace::new()
-        .bind(Exact::new("urn:system:exec"), exec())
         .bind(
             Exact::new("urn:repo:status"),
             git_facade(
@@ -822,38 +788,75 @@ mod tests {
         block_on(kernel().issue(request, cap))
     }
 
+    /// The space serves no low-level exec (ledger #1706): `urn:system:exec` is
+    /// unbound, so the kernel answers it with the typed `Unresolved` it gives any
+    /// name nothing binds — under the root capability and under the per-tool
+    /// grant alike, so no grant reaches a caller-built argv.
     #[test]
-    fn exec_is_capability_gated_and_allowlisted() {
-        let git = Capability::scoped(["urn:cap:exec:git"]);
+    fn system_exec_is_not_served() {
+        for cap in [
+            Capability::root(),
+            Capability::scoped(["urn:cap:exec:git", "urn:cap:exec:gh", "urn:cap:exec:*"]),
+        ] {
+            let err = source(
+                "urn:system:exec",
+                &[("tool", "git"), ("args", "--version")],
+                &cap,
+            )
+            .unwrap_err();
+            assert!(matches!(err, Error::Unresolved(_)), "{err:?}");
+        }
+    }
 
+    /// Call the private [`run`] with a FIXED tool and argv, as a facade does,
+    /// through a one-endpoint kernel (an `Invocation` is the kernel's to build).
+    /// No description, so nothing but `run` itself gates the call.
+    fn run_fixed(
+        tool: &'static str,
+        args: &'static [&'static str],
+        cap: &Capability,
+    ) -> Result<Representation> {
+        let probe = FnEndpoint::new("run-probe", move |inv: &Invocation<'_>| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            run(inv, tool, &args, None).map(text)
+        });
+        let kernel = Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:run"), probe),
+        ));
+        let request = Request::new(Verb::Source, Iri::parse("urn:test:run").unwrap());
+        block_on(kernel.issue(request, cap))
+    }
+
+    /// The gate every facade rides: `run` refuses a tool off the allowlist and a
+    /// caller without `urn:cap:exec:{tool}`, both before a process is spawned.
+    /// (Moved from the retired `urn:system:exec` test, which pinned the same two
+    /// refusals through that endpoint.)
+    #[test]
+    fn run_is_capability_gated_and_allowlisted() {
         // No exec grant at all → denied. A capability denial is the typed,
         // permanent `Denied` — never a generic `Endpoint` string, and never
         // transient (re-issuing under the same capability won't change the answer).
         let none = Capability::scoped(["urn:cap:unrelated"]);
-        let err = source(
-            "urn:system:exec",
-            &[("tool", "git"), ("args", "--version")],
-            &none,
-        )
-        .unwrap_err();
+        let err = run_fixed("git", &["--version"], &none).unwrap_err();
         assert!(matches!(err, Error::Denied(_)), "{err:?}");
         assert!(!err.is_transient(), "{err:?}");
 
+        // A grant for one tool does not reach another.
+        let gh = Capability::scoped(["urn:cap:exec:gh"]);
+        let err = run_fixed("git", &["--version"], &gh).unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+
         // A non-allowlisted tool → refused before any process, even under a matching cap.
-        let evil = Capability::scoped(["urn:cap:exec:rm"]);
-        let err = source("urn:system:exec", &[("tool", "rm"), ("args", "-rf")], &evil).unwrap_err();
+        let other = Capability::scoped(["urn:cap:exec:rm"]);
+        let err = run_fixed("rm", &[], &other).unwrap_err();
         assert!(
             format!("{err:?}").contains("not an allowlisted tool"),
             "{err:?}"
         );
 
         // git --version under the git grant → runs, stdout carries "git version".
-        let out = source(
-            "urn:system:exec",
-            &[("tool", "git"), ("args", "--version")],
-            &git,
-        )
-        .unwrap();
+        let git = Capability::scoped(["urn:cap:exec:git"]);
+        let out = run_fixed("git", &["--version"], &git).unwrap();
         assert!(
             String::from_utf8_lossy(&out.bytes).contains("git version"),
             "{:?}",

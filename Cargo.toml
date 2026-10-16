@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-repo"
-description = "Git / gh / cargo as ikigai resources: a capability-gated exec seam + typed repo facades (urn:system:exec, urn:repo:*)."
+description = "Git and gh as ikigai resources: typed, capability-gated repo facades (urn:repo:*)."
 version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
