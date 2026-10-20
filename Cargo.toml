@@ -17,8 +17,10 @@ ikigai-core = "0.1.89"
 
 [dev-dependencies]
 futures = "0.3"
-# The module recipe as one test (`tests/conformance.rs`). 0.8.0 is the floor for
-# REQUIRED and `Checks::STATIC` (ledger #329, #348). Under 0.x a caret is also a
-# CEILING (<0.9.0): a later minor of the suite is a deliberate re-pin, not a
-# silent upgrade.
-ikigai-conformance = "0.8.0"
+# The module recipe as one test (`tests/conformance.rs`). 0.9 added the
+# contract-shape checks (REQUIRED probes input groups, OUTPUTS honors
+# output_from, PIPELINE's named-only line, VALIDATE refuses a default on a
+# binding) and RECOMPUTE; 0.10 adds FAILURES, OFF unless a suite opts in. Under
+# 0.x a caret is also a CEILING: "0.10.0" reads as >=0.10.0, <0.11.0, so a later
+# minor of the suite is a deliberate re-pin, not a silent upgrade.
+ikigai-conformance = "0.10.0"

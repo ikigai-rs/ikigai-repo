@@ -56,7 +56,7 @@
 //! the cwd per invocation, never while building), so it is declared self-named:
 //! SPACE-NAME holds it to `urn:iki:space:repo`, the same doors on every call.
 
-use ikigai_conformance::{Fixture, Report, Suite};
+use ikigai_conformance::{Check, Fixture, Report, Suite};
 use ikigai_core::{
     ArgRef, Capability, EndpointSpace, Error, Iri, Kernel, Representation, Request, Verb,
 };
@@ -161,7 +161,8 @@ fn suite(scratch: &Scratch) -> Suite {
     suite
 }
 
-/// The walk saw every endpoint, one Source action each, skipped no check, and
+/// The walk saw every endpoint, one Source action each, skipped no check but
+/// FAILURES (off unless a suite opts in; turning it on is the next wave), and
 /// opted out exactly the GitHub facades. A tenth endpoint bound without a
 /// line here is held to a weaker standard; a listed id that binds nothing is a
 /// stale list.
@@ -172,9 +173,9 @@ fn assert_shape(report: &Report) {
         "one Source action each: {report}"
     );
     assert_eq!(
-        report.checks.skipped().count(),
-        0,
-        "every check runs: {report}"
+        report.checks.skipped().collect::<Vec<_>>(),
+        [Check::Failures],
+        "every check but FAILURES runs: {report}"
     );
     assert_eq!(
         report.declared.opted_out.len(),
