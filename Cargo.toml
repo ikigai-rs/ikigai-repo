@@ -1,7 +1,7 @@
 [package]
 name = "ikigai-repo"
 description = "Git and gh as ikigai resources: typed, capability-gated repo facades (urn:repo:*)."
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -11,16 +11,19 @@ repository = "https://github.com/ikigai-rs/ikigai-repo"
 # The released kernel, consumed from crates.io. This module is NATIVE-ONLY: it
 # spawns subprocesses (std::process), the one thing a wasm module can't — the
 # platform seam, like ikigai-personal's EventKit. No wasm face by design.
-# 0.1.108 is the floor for typed `Error::OverBudget` output refusals.
-# A 0.1.x caret is a range up to <0.2.0.
-ikigai-core = "0.1.108"
+# 0.2.0 is the streams release (ledger #2261). The old "0.1.108" pin (the
+# floor for typed `Error::OverBudget` output refusals) meant <0.2.0 under 0.x
+# rules, so this is a deliberate re-pin, and core's types are in this crate's
+# API: hence this crate's own minor bump to 0.3.0.
+ikigai-core = "0.2.0"
 
 [dev-dependencies]
 futures = "0.3"
 # The module recipe as one test (`tests/conformance.rs`). 0.9 added the
 # contract-shape checks (REQUIRED probes input groups, OUTPUTS honors
 # output_from, PIPELINE's named-only line, VALIDATE refuses a default on a
-# binding) and RECOMPUTE; 0.10 adds FAILURES, OFF unless a suite opts in. Under
-# 0.x a caret is also a CEILING: "0.10.0" reads as >=0.10.0, <0.11.0, so a later
-# minor of the suite is a deliberate re-pin, not a silent upgrade.
-ikigai-conformance = "0.10.0"
+# binding) and RECOMPUTE; 0.10 added FAILURES; 0.11 is the suite on core 0.2.0
+# and turns DATATYPES and FAILURES on by default. Under 0.x a caret is also a
+# CEILING: "0.11.0" reads as >=0.11.0, <0.12.0, so a later minor of the suite
+# is a deliberate re-pin, not a silent upgrade.
+ikigai-conformance = "0.11.0"

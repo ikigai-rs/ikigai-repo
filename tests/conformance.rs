@@ -161,8 +161,9 @@ fn suite(scratch: &Scratch) -> Suite {
     suite
 }
 
-/// The walk saw every endpoint, one Source action each, skipped no check but
-/// FAILURES (off unless a suite opts in; turning it on is the next wave), and
+/// The walk saw every endpoint, one Source action each, skipped no check
+/// (ikigai-conformance 0.11 runs DATATYPES and FAILURES by default; with no RDF
+/// face and no action stating failure classes, both have nothing to flag), and
 /// opted out exactly the GitHub facades. A tenth endpoint bound without a
 /// line here is held to a weaker standard; a listed id that binds nothing is a
 /// stale list.
@@ -173,9 +174,9 @@ fn assert_shape(report: &Report) {
         "one Source action each: {report}"
     );
     assert_eq!(
-        report.checks.skipped().collect::<Vec<_>>(),
-        [Check::Failures],
-        "every check but FAILURES runs: {report}"
+        report.checks.skipped().collect::<Vec<Check>>(),
+        [],
+        "every check runs: {report}"
     );
     assert_eq!(
         report.declared.opted_out.len(),
