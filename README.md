@@ -28,6 +28,13 @@ Each facade declares and enforces the concrete capability it needs:
 `pr:*` family. Those grants gate only these facades: holding
 `urn:cap:exec:git` does not let a caller choose what git runs.
 
+Every git/gh invocation accepts at most **8 MiB (8,388,608 raw bytes) per
+output pipe**, stdout and stderr (16 MiB combined). At exactly the limit the
+output is accepted; one byte beyond either limit kills and reaps the subprocess
+and refuses the entire call with typed `OverBudget`. Output is never truncated
+or returned partially, including on a nonzero exit. Large diffs or logs must be
+narrowed before retrying.
+
 A facade pointed with `dir=` at a repository honors that repository's own
 configuration, as git and gh always do; `dir=` is not confined to a root.
 
