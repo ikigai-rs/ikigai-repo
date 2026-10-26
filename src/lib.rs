@@ -55,8 +55,9 @@
 //! names, never spawning a process — so it declares and enforces
 //! `urn:cap:fs:read:*` instead of an `exec:*` scope.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 
 use ikigai_core::{
@@ -69,6 +70,80 @@ use ikigai_core::{
 /// Only `git` and `gh` have facades; `run` is private and every call site
 /// passes a fixed tool, so the list is a backstop, not a menu.
 const ALLOWED_TOOLS: &[&str] = &["git", "gh"];
+
+/// Maximum raw bytes captured from EACH of stdout and stderr for one git/gh
+/// invocation (8 MiB each, 16 MiB combined). Exceeding either limit refuses the
+/// entire call with [`Error::OverBudget`]; partial output is never returned.
+pub const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
+fn read_output(reader: impl Read, tool: &str, stream: &str) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_OUTPUT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::Endpoint(format!("exec: could not read `{tool}` {stream}: {e}")))?;
+    if bytes.len() > MAX_OUTPUT_BYTES {
+        return Err(Error::OverBudget {
+            detail: format!(
+                "exec: `{tool}` {stream} exceeds {MAX_OUTPUT_BYTES} bytes (8 MiB); no output returned"
+            ),
+        });
+    }
+    Ok(bytes)
+}
+
+/// Drain both pipes concurrently: reading one to completion first can deadlock
+/// when the child fills the other. A reader reports overflow immediately so we
+/// kill and reap the child, rather than continuing to buffer or drain its output.
+fn bounded_output(command: &mut Command, tool: &str) -> Result<Output> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| Error::Endpoint(format!("exec: could not run `{tool}`: {e}")))?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (stdout, stderr, error) = std::thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let err_tx = tx.clone();
+        scope.spawn(move || {
+            let _ = tx.send((true, read_output(stdout, tool, "stdout")));
+        });
+        scope.spawn(move || {
+            let _ = err_tx.send((false, read_output(stderr, tool, "stderr")));
+        });
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut error = None;
+        for (is_stdout, result) in rx {
+            match result {
+                Ok(bytes) if is_stdout => stdout = bytes,
+                Ok(bytes) => stderr = bytes,
+                Err(err) => {
+                    // Preserve the first failure, especially OverBudget, even
+                    // when killing the child makes the other pipe fail too.
+                    if error.is_none() {
+                        error = Some(err);
+                        let _ = child.kill();
+                    }
+                }
+            }
+        }
+        (stdout, stderr, error)
+    });
+    let status = child.wait();
+    if let Some(error) = error {
+        return Err(error);
+    }
+    let status =
+        status.map_err(|e| Error::Endpoint(format!("exec: could not wait for `{tool}`: {e}")))?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
 
 /// The directories a facade may run in, as the host passed them. Shared by
 /// every facade of one space; canonicalized per call, never at construction, so
@@ -142,7 +217,9 @@ const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 /// capability or a `dir` outside every root is a typed, permanent
 /// [`Error::Denied`], while a non-zero exit or a spawn failure is an
 /// [`Error::Endpoint`] carrying stderr — so a caller sees *why*, as data. Every
-/// spawn in this crate goes through here, so every refusal comes first.
+/// spawn in this crate goes through here, so every authority refusal comes first.
+/// Each output pipe is bounded by [`MAX_OUTPUT_BYTES`]; overflow kills and reaps
+/// the child and returns [`Error::OverBudget`] without partial output.
 fn run(
     inv: &Invocation<'_>,
     tool: &str,
@@ -174,9 +251,7 @@ fn run(
             command.env("GIT_CEILING_DIRECTORIES", ceiling);
         }
     }
-    let output = command
-        .output()
-        .map_err(|e| Error::Endpoint(format!("exec: could not run `{tool}`: {e}")))?;
+    let output = bounded_output(&mut command, tool)?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
@@ -967,6 +1042,107 @@ mod tests {
         ));
         let request = Request::new(Verb::Source, Iri::parse("urn:test:run").unwrap());
         block_on(kernel.issue(request, cap))
+    }
+
+    #[test]
+    fn output_reader_accepts_exact_limit_and_refuses_next_byte() {
+        for stream in ["stdout", "stderr"] {
+            let bytes = vec![b'x'; MAX_OUTPUT_BYTES];
+            assert_eq!(read_output(bytes.as_slice(), "git", stream).unwrap(), bytes);
+            let err = read_output(
+                std::io::repeat(b'x').take(MAX_OUTPUT_BYTES as u64 + 1),
+                "gh",
+                stream,
+            )
+            .unwrap_err();
+            assert!(matches!(err, Error::OverBudget { .. }), "{err:?}");
+            assert!(!err.is_transient());
+            assert!(err.to_string().contains(stream));
+            assert!(err.to_string().contains(&MAX_OUTPUT_BYTES.to_string()));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_capture_drains_both_pipes_and_preserves_exit_status() {
+        let output = bounded_output(
+            Command::new("sh").args(["-c", &format!(
+                "head -c {MAX_OUTPUT_BYTES} /dev/zero; head -c {MAX_OUTPUT_BYTES} /dev/zero >&2; exit 7"
+            )]), "fixture",
+        ).unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout, vec![0; MAX_OUTPUT_BYTES]);
+        assert_eq!(output.stderr, vec![0; MAX_OUTPUT_BYTES]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_capture_kills_unending_stdout_or_stderr_on_overflow() {
+        for script in ["exec yes x", "exec yes x >&2"] {
+            let err =
+                bounded_output(Command::new("sh").args(["-c", script]), "fixture").unwrap_err();
+            assert!(matches!(err, Error::OverBudget { .. }), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn run_refuses_stdout_one_byte_over_budget() {
+        // A real git blob: the bytes reaching run are exactly the file bytes.
+        let base = std::env::current_dir()
+            .unwrap()
+            .join("target/output-budget-test");
+        std::fs::create_dir_all(&base).unwrap();
+        assert!(Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(&base)
+            .status()
+            .unwrap()
+            .success());
+        let bytes = vec![b'x'; MAX_OUTPUT_BYTES + 1];
+        std::fs::write(base.join("blob"), &bytes).unwrap();
+        let hash = Command::new("git")
+            .arg("-C")
+            .arg(&base)
+            .args(["hash-object", "-w", "blob"])
+            .output()
+            .unwrap();
+        assert!(hash.status.success());
+        let hash = String::from_utf8(hash.stdout).unwrap().trim().to_string();
+        let probe = FnEndpoint::new("budget-probe", move |inv: &Invocation<'_>| {
+            run(
+                inv,
+                "git",
+                &[
+                    "-C".into(),
+                    base.to_str().unwrap().into(),
+                    "cat-file".into(),
+                    "blob".into(),
+                    hash.clone(),
+                ],
+                None,
+                &[],
+            )
+            .map(text)
+        });
+        let kernel = Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:budget"), probe),
+        ));
+        let result = issue_on(
+            &kernel,
+            "urn:test:budget",
+            &[],
+            &Capability::scoped(["urn:cap:exec:git"]),
+        );
+        assert!(
+            matches!(result, Err(Error::OverBudget { .. })),
+            "git output one byte over 8 MiB must be refused, got {}",
+            if result.is_ok() {
+                "success"
+            } else {
+                "another error"
+            }
+        );
     }
 
     /// The gate every facade rides: `run` refuses a tool off the allowlist and a
