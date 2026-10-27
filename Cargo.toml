@@ -1,7 +1,7 @@
 [package]
 name = "ikigai-repo"
 description = "Git and gh as ikigai resources: typed, capability-gated repo facades (urn:repo:*)."
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -14,11 +14,13 @@ repository = "https://github.com/ikigai-rs/ikigai-repo"
 # 0.2.0 is the streams release (ledger #2261). The old "0.1.108" pin (the
 # floor for typed `Error::OverBudget` output refusals) meant <0.2.0 under 0.x
 # rules, so this is a deliberate re-pin, and core's types are in this crate's
-# API: hence this crate's own minor bump to 0.3.0.
-ikigai-core = "0.2.0"
+# API: hence this crate's own minor bump to 0.3.0. The 0.2.1 floor now supplies
+# the body helpers used by the additive process-body path.
+ikigai-core = "0.2.1"
+async-trait = "0.1"
+futures = "0.3"
 
 [dev-dependencies]
-futures = "0.3"
 # The module recipe as one test (`tests/conformance.rs`). 0.9 added the
 # contract-shape checks (REQUIRED probes input groups, OUTPUTS honors
 # output_from, PIPELINE's named-only line, VALIDATE refuses a default on a
