@@ -162,8 +162,8 @@ fn suite(scratch: &Scratch) -> Suite {
 }
 
 /// The walk saw every endpoint, one Source action each, skipped no check
-/// (ikigai-conformance 0.11 runs DATATYPES and FAILURES by default; with no RDF
-/// face and no action stating failure classes, both have nothing to flag), and
+/// (ikigai-conformance 0.11 runs DATATYPES and FAILURES by default; the process
+/// body endpoints declare Unknown and OverBudget), and
 /// opted out exactly the GitHub facades. A tenth endpoint bound without a
 /// line here is held to a weaker standard; a listed id that binds nothing is a
 /// stale list.

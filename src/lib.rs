@@ -11,6 +11,16 @@
 //! Native-only by nature (it spawns subprocesses), so it carries no wasm face —
 //! it is to the shell what `ikigai-personal` is to EventKit.
 //!
+//! ## Process bodies
+//! [`ikigai_core::Endpoint::invoke_body`] serves `urn:repo:log` (both faces)
+//! and `urn:repo:pr:diff` as one-shot bodies. Stdout is read on demand in
+//! fixed-size chunks; JSON history retains only the current bounded record.
+//! The run's byte budget bounds the streamed answer, and stderr retains the
+//! independent [`MAX_OUTPUT_BYTES`] bound. Overflow and a non-zero exit end
+//! the body with an error item: a partial answer is never a complete answer.
+//! Dropping a body kills and reaps its direct child, including a pending read.
+//! The endpoints' bytes `invoke` implementation keeps its existing bounds.
+//!
 //! ## No low-level exec is served
 //! The space binds no endpoint that takes a caller's argument vector. An earlier
 //! `urn:system:exec` did (`tool=` + `args=` + `dir=`, gated only by a tool
@@ -54,6 +64,8 @@
 //! `urn:repo:list` is a filesystem read, not an exec — it enumerates directory
 //! names, never spawning a process — so it declares and enforces
 //! `urn:cap:fs:read:*` instead of an `exec:*` scope.
+
+mod process_body;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -227,6 +239,27 @@ fn run(
     dir: Option<&str>,
     roots: &[PathBuf],
 ) -> Result<String> {
+    let mut command = prepare_command(inv, tool, args, dir, roots)?;
+    let output = bounded_output(&mut command, tool)?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(Error::Endpoint(format!(
+            "exec: `{tool}` exited {}: {}",
+            output.status.code().unwrap_or(-1),
+            stderr.trim()
+        )))
+    }
+}
+
+fn prepare_command(
+    inv: &Invocation<'_>,
+    tool: &str,
+    args: &[String],
+    dir: Option<&str>,
+    roots: &[PathBuf],
+) -> Result<Command> {
     if !ALLOWED_TOOLS.contains(&tool) {
         return Err(Error::Endpoint(format!(
             "exec: `{tool}` is not an allowlisted tool ({})",
@@ -251,17 +284,7 @@ fn run(
             command.env("GIT_CEILING_DIRECTORIES", ceiling);
         }
     }
-    let output = bounded_output(&mut command, tool)?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(Error::Endpoint(format!(
-            "exec: `{tool}` exited {}: {}",
-            output.status.code().unwrap_or(-1),
-            stderr.trim()
-        )))
-    }
+    Ok(command)
 }
 
 fn text(body: String) -> Representation {
@@ -394,20 +417,10 @@ fn gh_pr_facade(
     sub: &'static [&'static str],
     json_fields: Option<&'static str>,
     roots: Roots,
-) -> FnEndpoint {
-    FnEndpoint::new(id, move |inv: &Invocation<'_>| {
-        let pr = parse_pr(inv)?;
-        let mut args: Vec<String> = sub.iter().map(|a| a.to_string()).collect();
-        args.push(pr.to_string());
-        let want_json = json_fields.is_some() && wants_json(inv);
-        if let (Some(fields), true) = (json_fields, want_json) {
-            args.push("--json".to_string());
-            args.push(fields.to_string());
-        }
-        if let Ok(repo) = inv.inline_str("repo") {
-            args.push("--repo".to_string());
-            args.push(repo.to_string());
-        }
+) -> impl ikigai_core::Endpoint {
+    let body_roots = roots.clone();
+    let endpoint = FnEndpoint::new(id, move |inv: &Invocation<'_>| {
+        let (args, want_json) = gh_pr_args(inv, sub, json_fields)?;
         let dir = inv.inline_str("dir").ok();
         run(inv, "gh", &args, dir, &roots).map(if want_json { json } else { text })
     })
@@ -447,7 +460,35 @@ fn gh_pr_facade(
             description = description.output("text/plain;charset=utf-8");
         }
         description
-    })
+    });
+    process_body::StreamingEndpoint {
+        inner: endpoint,
+        roots: body_roots,
+        kind: process_body::Kind::Pr {
+            sub,
+            enabled: id == "repo-pr-diff",
+        },
+    }
+}
+
+fn gh_pr_args(
+    inv: &Invocation<'_>,
+    sub: &[&str],
+    json_fields: Option<&str>,
+) -> Result<(Vec<String>, bool)> {
+    let pr = parse_pr(inv)?;
+    let mut args: Vec<String> = sub.iter().map(|a| a.to_string()).collect();
+    args.push(pr.to_string());
+    let want_json = json_fields.is_some() && wants_json(inv);
+    if let (Some(fields), true) = (json_fields, want_json) {
+        args.push("--json".to_string());
+        args.push(fields.to_string());
+    }
+    if let Ok(repo) = inv.inline_str("repo") {
+        args.push("--repo".to_string());
+        args.push(repo.to_string());
+    }
+    Ok((args, want_json))
 }
 
 /// The fields the structured `urn:repo:pr:view` face carries. `headRefOid` is
@@ -660,42 +701,13 @@ fn pr_list(roots: Roots) -> FnEndpoint {
 /// path-scoped log IS the merged-PR-per-path index; extracting the numbers
 /// stays downstream (a presentation concern), this face delivers honest
 /// subjects.
-fn log(roots: Roots) -> FnEndpoint {
-    FnEndpoint::new("repo-log", move |inv: &Invocation<'_>| {
-        let limit = parse_limit(inv, 20)?;
-        let path = parse_path(inv)?;
-        let want_json = wants_json(inv);
-        let mut args: Vec<String> = vec!["log".to_string()];
-        if want_json {
-            args.push("--pretty=format:%H%x1f%an%x1f%aI%x1f%s".to_string());
-        } else {
-            args.push("--oneline".to_string());
-        }
-        args.push(format!("-{limit}"));
-        // The pathspec rides after `--`, so it reaches git as a path and only
-        // a path — the same argv either face builds, shape untouched.
-        if let Some(path) = path {
-            args.push("--".to_string());
-            args.push(path);
-        }
+fn log(roots: Roots) -> impl ikigai_core::Endpoint {
+    let body_roots = roots.clone();
+    let endpoint = FnEndpoint::new("repo-log", move |inv: &Invocation<'_>| {
+        let (args, want_json) = log_args(inv)?;
         let raw = run(inv, "git", &args, inv.inline_str("dir").ok(), &roots)?;
         if want_json {
-            let entries: Vec<String> = raw
-                .lines()
-                .filter_map(|line| {
-                    let mut parts = line.splitn(4, '\x1f');
-                    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-                        (Some(hash), Some(author), Some(date), Some(subject)) => Some(format!(
-                            "{{\"hash\":{},\"author\":{},\"date\":{},\"subject\":{}}}",
-                            json_str(hash),
-                            json_str(author),
-                            json_str(date),
-                            json_str(subject)
-                        )),
-                        _ => None,
-                    }
-                })
-                .collect();
+            let entries: Vec<String> = raw.lines().filter_map(log_entry).collect();
             Ok(json(format!("[{}]", entries.join(","))))
         } else {
             Ok(text(raw))
@@ -734,7 +746,46 @@ fn log(roots: Roots) -> FnEndpoint {
             )
             .output("text/plain;charset=utf-8")
             .output("application/json"),
-    )
+    );
+    process_body::StreamingEndpoint {
+        inner: endpoint,
+        roots: body_roots,
+        kind: process_body::Kind::Log,
+    }
+}
+
+fn log_args(inv: &Invocation<'_>) -> Result<(Vec<String>, bool)> {
+    let limit = parse_limit(inv, 20)?;
+    let path = parse_path(inv)?;
+    let want_json = wants_json(inv);
+    let mut args: Vec<String> = vec!["log".to_string()];
+    if want_json {
+        args.push("--pretty=format:%H%x1f%an%x1f%aI%x1f%s".to_string());
+    } else {
+        args.push("--oneline".to_string());
+    }
+    args.push(format!("-{limit}"));
+    // The pathspec rides after `--`, so it reaches git as a path and only
+    // a path — the same argv either face builds, shape untouched.
+    if let Some(path) = path {
+        args.push("--".to_string());
+        args.push(path);
+    }
+    Ok((args, want_json))
+}
+
+fn log_entry(line: &str) -> Option<String> {
+    let mut parts = line.splitn(4, '\x1f');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(hash), Some(author), Some(date), Some(subject)) => Some(format!(
+            "{{\"hash\":{},\"author\":{},\"date\":{},\"subject\":{}}}",
+            json_str(hash),
+            json_str(author),
+            json_str(date),
+            json_str(subject)
+        )),
+        _ => None,
+    }
 }
 
 /// Where `urn:repo:list` scans, in priority order: an explicit `root=` arg,
