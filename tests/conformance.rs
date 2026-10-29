@@ -146,11 +146,14 @@ fn kernel(scratch: &Scratch) -> Kernel {
 
 /// The suite, configured for this module (see the file docs for why each line):
 /// every fired action reads the scratch repository, and the GitHub facades are
-/// opted out.
-fn suite(scratch: &Scratch) -> Suite {
+/// opted out. No input consumes body bytes or declares `reads_body`, so
+/// BODY-INPUTS needs no content store. BODIES receives the kernel's shared space,
+/// but these live answers remain explicitly unprobed (pinned in `assert_shape`).
+fn suite(scratch: &Scratch, space: Arc<EndpointSpace>) -> Suite {
     let mut suite = Suite::new()
+        .body_space(space.clone())
         .self_named_space("repo", ikigai_repo::space)
-        .host_named_space("space_with_roots(roots)", rooted(scratch))
+        .host_named_space("space_with_roots(roots)", space)
         .fixture(Fixture::new("repo-list", Verb::Source).arg("root", scratch.root()));
     for id in GIT_FACADES {
         suite = suite.fixture(Fixture::new(id, Verb::Source).arg("dir", scratch.dir()));
@@ -162,7 +165,7 @@ fn suite(scratch: &Scratch) -> Suite {
 }
 
 /// The walk saw every endpoint, one Source action each, skipped no check
-/// (ikigai-conformance 0.11 runs DATATYPES and FAILURES by default; the process
+/// (ikigai-conformance 0.12 also runs BODIES and BODY-INPUTS; the process
 /// body endpoints declare Unknown and OverBudget), and
 /// opted out exactly the GitHub facades. A tenth endpoint bound without a
 /// line here is held to a weaker standard; a listed id that binds nothing is a
@@ -178,6 +181,22 @@ fn assert_shape(report: &Report) {
         [],
         "every check runs: {report}"
     );
+    // Every local answer is live. Permit only the suite's volatility reason:
+    // missing body_space or any other setup gap must fail this test.
+    assert_eq!(report.unprobed.len(), 1 + GIT_FACADES.len(), "{report}");
+    for probe in report.unprobed.iter() {
+        assert!(
+            probe.endpoint == "repo-list" || GIT_FACADES.contains(&probe.endpoint.as_str()),
+            "{report}"
+        );
+        assert_eq!(probe.verb, Verb::Source, "{report}");
+        assert_eq!(probe.check, Check::Bodies, "{report}");
+        assert_eq!(
+            probe.reason,
+            "uncacheable, time-varying, or volatile answer: independent calls cannot establish method agreement (Suite::live, expiry or CACHEABLE's byte comparison)",
+            "{report}"
+        );
+    }
     assert_eq!(
         report.declared.opted_out.len(),
         GH_FACADES.len(),
@@ -188,7 +207,9 @@ fn assert_shape(report: &Report) {
 #[test]
 fn conforms() {
     let scratch = Scratch::new();
-    let report = suite(&scratch).run_blocking(&kernel(&scratch));
+    let space = rooted(&scratch);
+    let kernel = Kernel::new(space.clone());
+    let report = suite(&scratch, space).run_blocking(&kernel);
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");

@@ -21,11 +21,7 @@ async-trait = "0.1"
 futures = "0.3"
 
 [dev-dependencies]
-# The module recipe as one test (`tests/conformance.rs`). 0.9 added the
-# contract-shape checks (REQUIRED probes input groups, OUTPUTS honors
-# output_from, PIPELINE's named-only line, VALIDATE refuses a default on a
-# binding) and RECOMPUTE; 0.10 added FAILURES; 0.11 is the suite on core 0.2.0
-# and turns DATATYPES and FAILURES on by default. Under 0.x a caret is also a
-# CEILING: "0.11.0" reads as >=0.11.0, <0.12.0, so a later minor of the suite
-# is a deliberate re-pin, not a silent upgrade.
-ikigai-conformance = "0.11.0"
+# The module recipe as one test (`tests/conformance.rs`). 0.12 adds BODIES
+# and BODY-INPUTS by default. Under 0.x a caret is also a ceiling:
+# "0.12.0" means >=0.12.0, <0.13.0, so a later minor needs a deliberate re-pin.
+ikigai-conformance = "0.12.0"
