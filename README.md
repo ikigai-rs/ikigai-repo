@@ -87,5 +87,12 @@ anything. The space now answers that name `Unresolved`.
   runs cargo or just, so `urn:cap:exec:cargo` gates nothing here.
 - The facades are unchanged: same names, arguments, faces and capabilities.
 
+## Accessibility
+
+What this crate writes that people read (its own text faces and refusals), which output is
+git's and gh's and passes through unchanged, the rules it follows and its known limitations are
+in [ACCESSIBILITY.md](ACCESSIBILITY.md). Report a barrier with an issue labeled
+`accessibility`.
+
 ## License
 Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT).
