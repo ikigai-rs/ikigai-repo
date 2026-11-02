@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2
+
+- Confine an explicit `urn:repo:list` `root=` to the host-configured repository
+  roots after resolving symlinks and `..`. Preserve the host-selected default
+  (`IKIGAI_REPO_ROOT`, else `~/git-personal`) when `root=` is omitted.
+
 ## 0.3.1
 
 - Stream `urn:repo:log` (text and JSON) and `urn:repo:pr:diff` through
