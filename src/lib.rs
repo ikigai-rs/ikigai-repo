@@ -192,10 +192,15 @@ fn confine(roots: &[PathBuf], dir: &str) -> Result<Place> {
             "dir=`{dir}` is not a directory under a configured repository root"
         ))
     };
-    let target = Path::new(dir).canonicalize().map_err(|_| refused())?;
-    if !target.is_dir() {
-        return Err(refused());
-    }
+    // ambient: fs: the confinement check itself: resolves the caller's `dir=` (links, `..`) so it can be compared with the host-configured roots; reached from the git/gh facades only after their `urn:cap:exec:{tool}` check
+    #[allow(clippy::disallowed_methods)]
+    let target = Path::new(dir)
+        .canonicalize()
+        .ok()
+        .filter(|target| target.is_dir())
+        .ok_or_else(refused)?;
+    // ambient: fs: resolves the host-configured repository roots (never a request name) the same way, so the comparison above is component-wise on real paths
+    #[allow(clippy::disallowed_methods)]
     let root = roots
         .iter()
         .filter_map(|root| root.canonicalize().ok())
@@ -275,6 +280,8 @@ fn prepare_command(
         )));
     }
     let place = dir.map(|dir| confine(roots, dir)).transpose()?;
+    // ambient: process: running git and gh is this connector's job; the tool is one of ALLOWED_TOOLS, the caller holds `urn:cap:exec:{tool}` (checked above), and its directory is confined to the host's roots
+    #[allow(clippy::disallowed_methods)]
     let mut command = Command::new(tool);
     command.args(args);
     if let Some(place) = &place {
@@ -804,6 +811,31 @@ fn repo_root(inv: &Invocation<'_>) -> Result<PathBuf> {
     Ok(PathBuf::from(home).join("git-personal"))
 }
 
+/// The repositories directly under `root`: `(name, absolute path)` for each
+/// immediate child directory that holds a `.git` entry, unsorted.
+///
+/// One level deep only, and nothing is opened: it reads directory names and
+/// probes for `.git`. Non-UTF-8 names are skipped rather than mangled.
+// ambient: fs: urn:repo:list's directory scan, reached only after that endpoint's `urn:cap:fs:read:*` check; it reads the child names of its `root=` (else IKIGAI_REPO_ROOT, else ~/git-personal) and probes each for `.git`
+#[allow(clippy::disallowed_methods)]
+fn repos_under(root: &Path) -> std::io::Result<Vec<(String, String)>> {
+    let mut repos = Vec::new();
+    for entry in std::fs::read_dir(root)?.flatten() {
+        let path = entry.path();
+        // One level deep only: an immediate child dir carrying a `.git`.
+        if path.is_dir() && path.join(".git").exists() {
+            // Skip non-UTF-8 names rather than mangle them.
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            // Absolute path; fall back to the joined path if canonicalize fails.
+            let abs = path.canonicalize().unwrap_or(path);
+            repos.push((name, abs.display().to_string()));
+        }
+    }
+    Ok(repos)
+}
+
 /// `urn:repo:list` — enumerate the git repositories under a ROOT, one
 /// `name<TAB>path` per line, so an agent whose cwd is *not* a repo (the `ikigai
 /// mcp` case) can discover where repos live and hand one back as `dir=` to the
@@ -825,26 +857,12 @@ fn list() -> FnEndpoint {
             )));
         }
         let root = repo_root(inv)?;
-        let entries = std::fs::read_dir(&root).map_err(|e| {
+        let mut repos = repos_under(&root).map_err(|e| {
             Error::Endpoint(format!(
                 "repo-list: cannot read root `{}`: {e}",
                 root.display()
             ))
         })?;
-        let mut repos: Vec<(String, String)> = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            // One level deep only: an immediate child dir carrying a `.git`.
-            if path.is_dir() && path.join(".git").exists() {
-                // Skip non-UTF-8 names rather than mangle them.
-                let Ok(name) = entry.file_name().into_string() else {
-                    continue;
-                };
-                // Absolute path; fall back to the joined path if canonicalize fails.
-                let abs = path.canonicalize().unwrap_or(path);
-                repos.push((name, abs.display().to_string()));
-            }
-        }
         repos.sort();
         let body = repos
             .into_iter()
