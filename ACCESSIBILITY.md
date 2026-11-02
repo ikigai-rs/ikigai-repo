@@ -27,7 +27,7 @@ All of it is in `src/lib.rs` unless named otherwise.
   (one path per line) and `urn:repo:list` (`name`, a tab, `path`). The JSON faces
   (`as=application/json`) are for programs.
 - **Refusals and errors**: a capability that does not grant `urn:cap:exec:git` or
-  `urn:cap:exec:gh`, a `dir=` outside the configured roots, a `limit`, `pr` or `state` that is
+  `urn:cap:exec:gh`, a `dir=` or explicit list `root=` outside the configured roots, a `limit`, `pr` or `state` that is
   not a valid value (`state must be one of open, closed, merged, all, got …`), a `path` that is
   a flag, output past the 8 MiB limit, and a tool that failed: `` exec: `git` exited N: `` and
   then the tool's own stderr (`src/process_body.rs` does the same for a streamed answer).
@@ -57,6 +57,7 @@ that shows these.
   refusal's list; `output_reader_accepts_exact_limit_and_refuses_next_byte` that the refusal
   states the limit; `run_is_capability_gated_and_allowlisted` the allowlist refusal;
   `no_roots_refuses_every_dir` that the `dir=` refusal names what to configure;
+  `list_confines_explicit_roots_after_resolving_paths` that list refusals name `root=`;
   `git_does_not_search_above_the_root` that git's own `not a git repository` reaches the
   caller; `pr_list_builds_the_gh_invocation` the text face's template.
 - `src/process_body.rs`: `late_nonzero_exit_is_an_error_item_with_stderr` pins the exit status

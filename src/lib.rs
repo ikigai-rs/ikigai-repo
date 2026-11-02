@@ -63,7 +63,9 @@
 //!
 //! `urn:repo:list` is a filesystem read, not an exec — it enumerates directory
 //! names, never spawning a process — so it declares and enforces
-//! `urn:cap:fs:read:*` instead of an `exec:*` scope.
+//! `urn:cap:fs:read:*` instead of an `exec:*` scope. An explicit `root=` is
+//! confined to the host's repository roots just like `dir=`; omitting it uses
+//! the host-selected `$IKIGAI_REPO_ROOT`, else `~/git-personal`.
 
 mod process_body;
 
@@ -180,19 +182,24 @@ struct Place {
 /// outside path exists. The ceiling is the parent of the OUTERMOST root that
 /// holds the directory, so git may still find a repository at any root above it.
 fn confine(roots: &[PathBuf], dir: &str) -> Result<Place> {
+    confine_path(roots, "dir", dir)
+}
+
+/// Apply the same canonical path boundary to a directory or an explicit list root.
+fn confine_path(roots: &[PathBuf], arg: &str, dir: &str) -> Result<Place> {
     if roots.is_empty() {
         return Err(Error::Denied(format!(
-            "dir=`{dir}` refused: this space has no repository roots configured, so it runs \
+            "{arg}=`{dir}` refused: this space has no repository roots configured, so it runs \
              in no caller-named directory; a host passes the directories it serves with \
              ikigai_repo::space_with_roots(..)"
         )));
     }
     let refused = || {
         Error::Denied(format!(
-            "dir=`{dir}` is not a directory under a configured repository root"
+            "{arg}=`{dir}` is not a directory under a configured repository root"
         ))
     };
-    // ambient: fs: the confinement check itself: resolves the caller's `dir=` (links, `..`) so it can be compared with the host-configured roots; reached from the git/gh facades only after their `urn:cap:exec:{tool}` check
+    // ambient: fs: resolves the caller's directory (links, `..`) to compare with host-configured roots; reached only after the facade's exec grant or the list endpoint's filesystem read grant check
     #[allow(clippy::disallowed_methods)]
     let target = Path::new(dir)
         .canonicalize()
@@ -214,8 +221,8 @@ fn confine(roots: &[PathBuf], dir: &str) -> Result<Place> {
 }
 
 /// Listing the repositories under a ROOT reads directory names — a filesystem
-/// read. `urn:repo:list` declares and enforces this scope (the MCP `claude`
-/// grant already holds `urn:cap:fs:read:*`). Matching is exact today, so the
+/// read. `urn:repo:list` declares and enforces this scope (a named MCP
+/// grant can hold `urn:cap:fs:read:*`). Matching is exact today, so the
 /// wildcard token is the literal grant, not a prefix rule.
 const FS_READ: &str = "urn:cap:fs:read:*";
 
@@ -847,8 +854,8 @@ fn repos_under(root: &Path) -> std::io::Result<Vec<(String, String)>> {
 /// names is a filesystem read — this crate is native-only by design, so it
 /// reads the directory with `std::fs` directly rather than through a kernel fs
 /// mount — gated on [`FS_READ`], never shelling out (so no exec cap).
-fn list() -> FnEndpoint {
-    FnEndpoint::new("repo-list", |inv: &Invocation<'_>| {
+fn list(roots: Roots) -> FnEndpoint {
+    FnEndpoint::new("repo-list", move |inv: &Invocation<'_>| {
         if !inv.capability.allows(FS_READ) {
             // Typed `Denied` — a permanent authority failure the trace, manifold,
             // and wire recognize as a 403-equivalent without sniffing message text.
@@ -856,7 +863,11 @@ fn list() -> FnEndpoint {
                 "repo-list: capability does not grant `{FS_READ}`"
             )));
         }
-        let root = repo_root(inv)?;
+        let root = if let Ok(root) = inv.inline_str("root") {
+            confine_path(&roots, "root", root)?.dir
+        } else {
+            repo_root(inv)?
+        };
         let mut repos = repos_under(&root).map_err(|e| {
             Error::Endpoint(format!(
                 "repo-list: cannot read root `{}`: {e}",
@@ -882,7 +893,8 @@ fn list() -> FnEndpoint {
                 "Enumerate the git repositories under a ROOT — each as name<TAB>path, one per \
                  line — so an agent whose cwd is not a repo (e.g. ikigai mcp) can discover where \
                  repos live and pass one as dir= to the urn:repo:* facades. ROOT is root= (arg), \
-                 else $IKIGAI_REPO_ROOT, else ~/git-personal; immediate child directories only.",
+                 else $IKIGAI_REPO_ROOT, else ~/git-personal; immediate child directories only. \
+                 An explicit root= must resolve under a host-configured repository root.",
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
@@ -891,7 +903,8 @@ fn list() -> FnEndpoint {
                 ArgSpec::new("root")
                     .class(XSD_STRING)
                     .summary(
-                        "the directory to scan (default: $IKIGAI_REPO_ROOT, else ~/git-personal)",
+                        "the directory to scan, within a configured repository root \
+                         (default: $IKIGAI_REPO_ROOT, else ~/git-personal)",
                     )
                     .optional(),
             )
@@ -906,7 +919,8 @@ pub const SPACE_ID: &str = "urn:iki:space:repo";
 ///
 /// Every `dir=` is refused with a typed [`Error::Denied`] that names
 /// [`space_with_roots`]; a call without `dir=` still runs in the process's
-/// working directory, and `urn:repo:list` is unaffected. It serves no low-level
+/// working directory, and `urn:repo:list` without `root=` uses its host-selected default.
+/// An explicit `root=` is refused too. It serves no low-level
 /// exec: `urn:system:exec` is not bound, so the kernel answers it `Unresolved`
 /// (ledger #1706).
 ///
@@ -922,7 +936,8 @@ pub fn space() -> EndpointSpace {
 /// (ledger #1712): the directories the host serves, such as gonk's browse roots.
 /// A `dir=` resolving outside all of them, by a plain path, a `..` or a
 /// symlink, is refused with a typed [`Error::Denied`] before a process is
-/// spawned. An empty `roots` refuses every `dir=`, as [`space`] does.
+/// spawned. Explicit list `root=` paths use the same boundary. An empty
+/// `roots` refuses every `dir=` and explicit `root=`, as [`space`] does.
 ///
 /// Roots are canonicalized on each call, not here, so building the space reads
 /// nothing and a root created later is honored. A root that does not resolve
@@ -987,7 +1002,7 @@ fn bind(roots: Roots) -> EndpointSpace {
                 roots.clone(),
             ),
         )
-        .bind(Exact::new("urn:repo:list"), list())
+        .bind(Exact::new("urn:repo:list"), list(roots.clone()))
         .bind(
             Exact::new("urn:repo:pr:checks"),
             gh_pr_facade(
@@ -1545,6 +1560,109 @@ mod tests {
     }
 
     #[test]
+    fn list_refuses_root_outside_host_roots() {
+        let base = Base::new("list-outside");
+        let allowed = base.dir("allowed");
+        let outside = base.dir("outside");
+        base.dir("outside/secret-repo/.git");
+        let fs = Capability::scoped([FS_READ]);
+        let result = source_under(
+            &[&allowed],
+            "urn:repo:list",
+            &[("root", outside.to_str().unwrap())],
+            &fs,
+        );
+        if let Ok(out) = &result {
+            assert!(String::from_utf8_lossy(&out.bytes).contains("secret-repo\t"));
+        }
+        assert_denied(result, "list outside host roots");
+    }
+
+    #[test]
+    fn list_confines_explicit_roots_after_resolving_paths() {
+        let base = Base::new("list-boundary");
+        let allowed = base.dir("allowed");
+        let outside = base.dir("allowed-sibling");
+        base.dir("allowed-sibling/hidden/.git");
+        let nested = base.dir("allowed/nested");
+        base.dir("allowed/nested/visible/.git");
+        let fs = Capability::scoped([FS_READ]);
+        for path in [
+            outside.clone(),
+            allowed.join("../allowed-sibling"),
+            allowed.join("absent"),
+        ] {
+            let err = source_under(
+                &[&allowed],
+                "urn:repo:list",
+                &[("root", path.to_str().unwrap())],
+                &fs,
+            )
+            .unwrap_err();
+            assert!(matches!(err, Error::Denied(_)), "{err:?}");
+            assert!(err.to_string().contains("root=`"), "{err:?}");
+        }
+        assert_denied(
+            source("urn:repo:list", &[("root", allowed.to_str().unwrap())], &fs),
+            "explicit root with no configured roots",
+        );
+        let out = source_under(
+            &[&allowed],
+            "urn:repo:list",
+            &[("root", nested.to_str().unwrap())],
+            &fs,
+        )
+        .unwrap();
+        assert!(String::from_utf8_lossy(&out.bytes).starts_with("visible\t"));
+        #[cfg(unix)]
+        {
+            let link = allowed.join("escape");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            assert_denied(
+                source_under(
+                    &[&allowed],
+                    "urn:repo:list",
+                    &[("root", link.to_str().unwrap())],
+                    &fs,
+                ),
+                "symlink outside roots",
+            );
+        }
+    }
+
+    #[test]
+    fn list_preserves_host_selected_defaults() {
+        // Environment overrides belong to child processes, leaving parallel tests untouched.
+        const MARKER: &str = "IKIGAI_REPO_LIST_DEFAULT_TEST";
+        if std::env::var_os(MARKER).is_some() {
+            let out = source("urn:repo:list", &[], &Capability::scoped([FS_READ])).unwrap();
+            assert!(String::from_utf8_lossy(&out.bytes).starts_with("default-repo\t"));
+            return;
+        }
+        let base = Base::new("list-default");
+        let configured = base.dir("configured");
+        base.dir("configured/default-repo/.git");
+        base.dir("git-personal/default-repo/.git");
+        for explicit_env in [true, false] {
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "tests::list_preserves_host_selected_defaults",
+                    "--nocapture",
+                ])
+                .env(MARKER, "1")
+                .env("HOME", &base.0)
+                .env_remove("IKIGAI_REPO_ROOT");
+            if explicit_env {
+                child.env("IKIGAI_REPO_ROOT", &configured);
+            }
+            let out = child.output().unwrap();
+            assert!(out.status.success(), "{out:?}");
+        }
+    }
+
+    #[test]
     fn list_enumerates_repos_under_root() {
         // A self-contained ROOT: two fake repos (dirs holding a `.git`) plus a
         // decoy non-repo dir — no dependency on ~/git-personal.
@@ -1557,7 +1675,13 @@ mod tests {
         std::fs::create_dir_all(base.join("not-a-repo")).unwrap();
 
         let fs = Capability::scoped(["urn:cap:fs:read:*"]);
-        let out = source("urn:repo:list", &[("root", base.to_str().unwrap())], &fs).unwrap();
+        let out = source_under(
+            &[&base],
+            "urn:repo:list",
+            &[("root", base.to_str().unwrap())],
+            &fs,
+        )
+        .unwrap();
         let body = String::from_utf8_lossy(&out.bytes).into_owned();
         let lines: Vec<&str> = body.lines().collect();
 

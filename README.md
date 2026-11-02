@@ -13,7 +13,7 @@ argv. There is **no low-level exec endpoint** (see [Changes](#changes)):
 | `urn:repo:status` | the working tree's status (`git status --porcelain=v1 -b`) |
 | `urn:repo:log` | recent history (`git log --oneline`, `limit=` commits, default 20); `path=` restricts to commits touching a file/subtree (`git log -- <path>`) — under squash-merge style, the merged-PR-per-path index; `as=application/json` → `[{hash, author, date, subject}]` (full sha, RFC 3339 date) |
 | `urn:repo:branch` | the current branch |
-| `urn:repo:list` | enumerate the git repos under a ROOT (`root=`, else `$IKIGAI_REPO_ROOT`, else `~/git-personal`) as `name`⇥`path`; a filesystem read, gated on `urn:cap:fs:read:*` (no exec cap) |
+| `urn:repo:list` | enumerate the git repos under a ROOT (`root=`, else `$IKIGAI_REPO_ROOT`, else `~/git-personal`) as `name`⇥`path`; a filesystem read, gated on `urn:cap:fs:read:*`; explicit `root=` must resolve under a host-configured repository root (no exec cap) |
 | `urn:repo:pr:list` | the PRs, most recently updated first (`gh pr list`), one per line as `number`⇥`title`⇥`state`⇥`branch`⇥`updated` (RFC 3339); `state=` (open/closed/merged/all, default open); `as=application/json` for the structured face; `limit=` (default 30) |
 | `urn:repo:pr:view` | a PR's title, state, and metadata (`gh pr view N`); `as=application/json` for the structured face, incl. `headRefOid` — the PR head commit sha |
 | `urn:repo:pr:files` | the paths a PR changes (`gh pr view N --json files`), one per line; `as=application/json` → `{files: [{path, additions, deletions, changeType}]}` — the open-PR half of "which PRs touch this subtree" (`urn:repo:log path=` is the merged half) |
