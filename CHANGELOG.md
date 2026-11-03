@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.0
+
+- Re-pin to `ikigai-core` 0.3.0, the scoped content store (ledger #2965), and
+  `ikigai-conformance` 0.14.0 in tests. Core's types are in this crate's public
+  API, so this is a minor bump. This crate calls neither `ContentStore::put` nor
+  `put_replay`, and no output changes.
+
 ## 0.3.2
 
 - Confine an explicit `urn:repo:list` `root=` to the host-configured repository
