@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Add `urn:repo:show` (`dir`, `rev`, `path`): a file's exact bytes at a commit,
+  under `urn:cap:exec:git`, confined to the roots like every `dir=`. A rev that
+  names no commit and a path that is not a file at that commit answer typed
+  `NotFound`; a git failure stays an `Endpoint` error, so it never reads as a
+  miss. This is the read `ikigai-name`'s as-of binding (`repo_history`) calls.
+
 ## 0.4.0
 
 - Re-pin to `ikigai-core` 0.3.0, the scoped content store (ledger #2965), and

@@ -12,7 +12,7 @@ git's and gh's own; this file says which. It is not a conformance claim. Adapted
 | Status | Evaluation in progress. No conformance claim. |
 | Owner | the maintainers of this repository |
 | Report a barrier | [a GitHub issue](https://github.com/ikigai-rs/ikigai-repo/issues/new?labels=accessibility) with the `accessibility` label; anything security-sensitive through [private vulnerability reporting](https://github.com/ikigai-rs/ikigai-repo/security/advisories/new) |
-| Last reviewed | 2026-10-31 |
+| Last reviewed | 2026-11-03 |
 
 ## What it emits that people read
 
@@ -21,7 +21,8 @@ All of it is in `src/lib.rs` unless named otherwise.
 - **git's and gh's own output, passed through**: `urn:repo:status` (`git status
   --porcelain=v1 -b`), `urn:repo:log` (`git log --oneline`), `urn:repo:branch`,
   `urn:repo:pr:view`, `urn:repo:pr:diff` and `urn:repo:pr:checks`. The words, codes and layout
-  are git's and gh's.
+  are git's and gh's. `urn:repo:show` passes on a file's bytes from a repository, unchanged and
+  as `application/octet-stream`: they may not be text, and they are not this crate's words.
 - **Text faces this crate shapes**: `urn:repo:pr:list` (one PR per line, `number`, `title`,
   `state`, `branch`, `updated` separated by tabs, through a gh template), `urn:repo:pr:files`
   (one path per line) and `urn:repo:list` (`name`, a tab, `path`). The JSON faces
@@ -29,7 +30,9 @@ All of it is in `src/lib.rs` unless named otherwise.
 - **Refusals and errors**: a capability that does not grant `urn:cap:exec:git` or
   `urn:cap:exec:gh`, a `dir=` or explicit list `root=` outside the configured roots, a `limit`, `pr` or `state` that is
   not a valid value (`state must be one of open, closed, merged, all, got …`), a `path` that is
-  a flag, output past the 8 MiB limit, and a tool that failed: `` exec: `git` exited N: `` and
+  a flag, a `rev` or `path` that `urn:repo:show` cannot take or that does not exist (``rev `…`
+  does not name a commit in this repository``, ``path `…` is not a file at commit …``), output
+  past the 8 MiB limit, and a tool that failed: `` exec: `git` exited N: `` and
   then the tool's own stderr (`src/process_body.rs` does the same for a streamed answer).
 - **The facades' self-descriptions**: the summaries of every facade and argument, which a host
   shows in its catalog, help or tool list.
@@ -43,7 +46,7 @@ that shows these.
 ## The rules that output follows
 
 - A refusal of an argument names the argument and quotes the value it got; a closed vocabulary
-  is listed in the refusal.
+  is listed in the refusal. `urn:repo:show` escapes control characters in the value it quotes.
 - A tool that fails is named, with its exit status, and its own stderr is passed on, not
   reworded.
 - Output past the limit is never handed over as if complete: a collected answer is refused
@@ -59,7 +62,9 @@ that shows these.
   `no_roots_refuses_every_dir` that the `dir=` refusal names what to configure;
   `list_confines_explicit_roots_after_resolving_paths` that list refusals name `root=`;
   `git_does_not_search_above_the_root` that git's own `not a git repository` reaches the
-  caller; `pr_list_builds_the_gh_invocation` the text face's template.
+  caller; `pr_list_builds_the_gh_invocation` the text face's template;
+  `show_refuses_a_path_or_rev_that_does_not_exist` that those refusals name the argument and
+  quote the value, and `show_refuses_flags_and_paths_out_of_the_tree` that the others name it.
 - `src/process_body.rs`: `late_nonzero_exit_is_an_error_item_with_stderr` pins the exit status
   and the tool's stderr in a streamed failure.
 
@@ -104,3 +109,4 @@ through
 | Date | Change |
 |---|---|
 | 2026-10-31 | First version. |
+| 2026-11-03 | Add `urn:repo:show`: its passed-through bytes and its refusals. |
