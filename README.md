@@ -12,6 +12,7 @@ argv. There is **no low-level exec endpoint** (see [Changes](#changes)):
 |----------|------------|
 | `urn:repo:status` | the working tree's status (`git status --porcelain=v1 -b`) |
 | `urn:repo:log` | recent history (`git log --oneline`, `limit=` commits, default 20); `path=` restricts to commits touching a file/subtree (`git log -- <path>`) — under squash-merge style, the merged-PR-per-path index; `as=application/json` → `[{hash, author, date, subject}]` (full sha, RFC 3339 date) |
+| `urn:repo:show` | one file's bytes at a commit (`git cat-file`): `rev=` (a commit hash, branch or tag) and `path=` (relative to the repository root, taken literally) are required; answers `application/octet-stream`, or typed `NotFound` when `rev=` names no commit or `path=` is not a file at that commit |
 | `urn:repo:branch` | the current branch |
 | `urn:repo:list` | enumerate the git repos under a ROOT (`root=`, else `$IKIGAI_REPO_ROOT`, else `~/git-personal`) as `name`⇥`path`; a filesystem read, gated on `urn:cap:fs:read:*`; explicit `root=` must resolve under a host-configured repository root (no exec cap) |
 | `urn:repo:pr:list` | the PRs, most recently updated first (`gh pr list`), one per line as `number`⇥`title`⇥`state`⇥`branch`⇥`updated` (RFC 3339); `state=` (open/closed/merged/all, default open); `as=application/json` for the structured face; `limit=` (default 30) |
@@ -24,7 +25,7 @@ The `pr:*` facades take `pr=` (the number) plus optional `repo=` (`owner/name`)
 or `dir=` (a repo directory to run in); they require `urn:cap:exec:gh`.
 
 Each facade declares and enforces the concrete capability it needs:
-`urn:cap:exec:git` for `status`/`log`/`branch`, `urn:cap:exec:gh` for the
+`urn:cap:exec:git` for `status`/`log`/`show`/`branch`, `urn:cap:exec:gh` for the
 `pr:*` family. Those grants gate only these facades: holding
 `urn:cap:exec:git` does not let a caller choose what git runs.
 

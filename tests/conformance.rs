@@ -1,4 +1,4 @@
-//! The module recipe as one test: `ikigai-conformance` walks the nine endpoints
+//! The module recipe as one test: `ikigai-conformance` walks the ten endpoints
 //! [`ikigai_repo::space`] binds and reports every violation at once.
 //!
 //! ## Nothing here is pure, and nothing is cached
@@ -20,7 +20,7 @@
 //!
 //! CI checkouts are shallow (fetch-depth 1), so no fired action reads the
 //! enclosing repository. [`Scratch`] builds a fresh `git init` with one commit
-//! under a hermetic identity, inside a base directory that doubles as the ROOT
+//! holding one file under a hermetic identity, inside a base directory that doubles as the ROOT
 //! `urn:repo:list` scans (so the listing finds exactly that one repo). Every
 //! git-backed action takes `dir=` pointing at it.
 //!
@@ -39,10 +39,9 @@
 //!
 //! ## REQUIRED on the fired actions
 //!
-//! Of the four actions the walk fires, none declares a required input: every
-//! fired input is optional. (The retired `urn:system:exec` carried the one that
-//! did, its `tool`; the space no longer serves it, ledger #1706.) REQUIRED is
-//! held on the `pr` facades by [`pr_facades_refuse_a_missing_pr_typed`].
+//! Of the five actions the walk fires, `urn:repo:show` alone declares required
+//! inputs (`rev`, `path`), so the suite drops each in turn. REQUIRED is held on
+//! the `pr` facades by [`pr_facades_refuse_a_missing_pr_typed`].
 //!
 //! No module namespace: there is no RDF face. NAMES runs: every id is kebab-case.
 //!
@@ -68,6 +67,9 @@ use std::sync::Arc;
 /// The git-backed facades, by description id: each takes `dir=`.
 const GIT_FACADES: [&str; 3] = ["repo-status", "repo-log", "repo-branch"];
 
+/// The file `urn:repo:show` reads from the scratch repository's one commit.
+const SHOW_FILE: &str = "vocab.ttl";
+
 /// The GitHub-backed facades, by description id and bound IRI.
 const GH_FACADES: [(&str, &str); 5] = [
     ("repo-pr-list", "urn:repo:pr:list"),
@@ -81,10 +83,10 @@ const GH_FACADES: [(&str, &str); 5] = [
 /// them, which CI cannot do and which is never a fixture.
 const REACHES_GITHUB: &str = "reaches api.github.com";
 
-/// Every endpoint `space()` binds: the listing, the git facades, the GitHub
-/// facades. Each declares exactly one action (Source; Meta is the kernel's).
+/// Every endpoint `space()` binds: the listing, the git facades, the file reader,
+/// the GitHub facades. Each declares exactly one action (Source; Meta is the kernel's).
 /// There is no low-level exec among them (ledger #1706).
-const ENDPOINTS: usize = 1 + GIT_FACADES.len() + GH_FACADES.len();
+const ENDPOINTS: usize = 2 + GIT_FACADES.len() + GH_FACADES.len();
 
 /// A hermetic scratch repository under a fresh base directory, removed on drop.
 struct Scratch {
@@ -115,7 +117,9 @@ impl Scratch {
             assert!(out.status.success(), "git {args:?}: {out:?}");
         };
         git(&["init", "-q"]);
-        git(&["commit", "-q", "--allow-empty", "-m", "conformance"]);
+        std::fs::write(repo.join(SHOW_FILE), "<urn:a> <urn:b> <urn:c> .\n").unwrap();
+        git(&["add", "--", SHOW_FILE]);
+        git(&["commit", "-q", "-m", "conformance"]);
         Scratch { base, repo }
     }
 
@@ -154,7 +158,13 @@ fn suite(scratch: &Scratch, space: Arc<EndpointSpace>) -> Suite {
         .body_space(space.clone())
         .self_named_space("repo", ikigai_repo::space)
         .host_named_space("space_with_roots(roots)", space)
-        .fixture(Fixture::new("repo-list", Verb::Source).arg("root", scratch.root()));
+        .fixture(Fixture::new("repo-list", Verb::Source).arg("root", scratch.root()))
+        .fixture(
+            Fixture::new("repo-show", Verb::Source)
+                .arg("dir", scratch.dir())
+                .arg("rev", "HEAD")
+                .arg("path", SHOW_FILE),
+        );
     for id in GIT_FACADES {
         suite = suite.fixture(Fixture::new(id, Verb::Source).arg("dir", scratch.dir()));
     }
@@ -167,7 +177,7 @@ fn suite(scratch: &Scratch, space: Arc<EndpointSpace>) -> Suite {
 /// The walk saw every endpoint, one Source action each, skipped no check
 /// (ikigai-conformance 0.12 also runs BODIES and BODY-INPUTS; the process
 /// body endpoints declare Unknown and OverBudget), and
-/// opted out exactly the GitHub facades. A tenth endpoint bound without a
+/// opted out exactly the GitHub facades. An eleventh endpoint bound without a
 /// line here is held to a weaker standard; a listed id that binds nothing is a
 /// stale list.
 fn assert_shape(report: &Report) {
@@ -183,10 +193,11 @@ fn assert_shape(report: &Report) {
     );
     // Every local answer is live. Permit only the suite's volatility reason:
     // missing body_space or any other setup gap must fail this test.
-    assert_eq!(report.unprobed.len(), 1 + GIT_FACADES.len(), "{report}");
+    assert_eq!(report.unprobed.len(), 2 + GIT_FACADES.len(), "{report}");
     for probe in report.unprobed.iter() {
         assert!(
-            probe.endpoint == "repo-list" || GIT_FACADES.contains(&probe.endpoint.as_str()),
+            ["repo-list", "repo-show"].contains(&probe.endpoint.as_str())
+                || GIT_FACADES.contains(&probe.endpoint.as_str()),
             "{report}"
         );
         assert_eq!(probe.verb, Verb::Source, "{report}");
@@ -303,7 +314,7 @@ fn declared_outputs_are_the_media_types_served() {
     let kernel = kernel(&scratch);
     let root = Capability::root();
     let dir = scratch.dir();
-    let calls: [(&str, Vec<(&str, &str)>); 5] = [
+    let calls: [(&str, Vec<(&str, &str)>); 6] = [
         ("urn:repo:status", vec![("dir", dir)]),
         ("urn:repo:branch", vec![("dir", dir)]),
         ("urn:repo:list", vec![("root", scratch.root())]),
@@ -311,6 +322,10 @@ fn declared_outputs_are_the_media_types_served() {
         (
             "urn:repo:log",
             vec![("dir", dir), ("as", "application/json")],
+        ),
+        (
+            "urn:repo:show",
+            vec![("dir", dir), ("rev", "HEAD"), ("path", SHOW_FILE)],
         ),
     ];
     let mut served_by_iri: std::collections::BTreeMap<&str, Vec<String>> = Default::default();

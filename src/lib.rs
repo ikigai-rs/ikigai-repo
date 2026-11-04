@@ -1,7 +1,7 @@
 //! Git and `gh` as ikigai resources.
 //!
 //! This module is the **platform seam** for development tooling: a set of
-//! **typed facades** (`urn:repo:status`, `:log`, `:branch`, and the
+//! **typed facades** (`urn:repo:status`, `:log`, `:show`, `:branch`, and the
 //! `urn:repo:pr:*` family: `:list`, `:view`, `:files`, `:diff`, `:checks`), each
 //! of which builds a FIXED argument vector for `git` or `gh` and speaks the
 //! ikigai self-description. A companion `urn:repo:list` enumerates the
@@ -29,8 +29,8 @@
 //! run other programs, so a per-tool grant over a caller-built argv was a grant
 //! to run anything (ledger #1706). The facades are the only seam: each fixes the
 //! subcommand and flags, and its caller supplies only typed values (a number, a
-//! state from a closed vocabulary, a pathspec after `--`, a directory, an
-//! `owner/name`).
+//! state from a closed vocabulary, a pathspec after `--`, a revision that is
+//! not a flag, a directory, an `owner/name`).
 //!
 //! ## `dir=` is confined to the host's roots
 //! A facade pointed with `dir=` at a repository honors that repository's own
@@ -251,18 +251,33 @@ fn run(
     dir: Option<&str>,
     roots: &[PathBuf],
 ) -> Result<String> {
-    let mut command = prepare_command(inv, tool, args, dir, roots)?;
-    let output = bounded_output(&mut command, tool)?;
+    let output = run_output(inv, tool, args, dir, roots)?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(Error::Endpoint(format!(
-            "exec: `{tool}` exited {}: {}",
-            output.status.code().unwrap_or(-1),
-            stderr.trim()
-        )))
+        Err(tool_failed(tool, &output))
     }
+}
+
+/// [`run`] up to the exit status, whatever it was, with stdout's raw bytes.
+fn run_output(
+    inv: &Invocation<'_>,
+    tool: &str,
+    args: &[String],
+    dir: Option<&str>,
+    roots: &[PathBuf],
+) -> Result<Output> {
+    let mut command = prepare_command(inv, tool, args, dir, roots)?;
+    bounded_output(&mut command, tool)
+}
+
+fn tool_failed(tool: &str, output: &Output) -> Error {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Error::Endpoint(format!(
+        "exec: `{tool}` exited {}: {}",
+        output.status.code().unwrap_or(-1),
+        stderr.trim()
+    ))
 }
 
 fn prepare_command(
@@ -802,6 +817,172 @@ fn log_entry(line: &str) -> Option<String> {
     }
 }
 
+/// A caller's value as a refusal quotes it: control characters are escaped, so
+/// a refusal never carries a terminal control code it was handed.
+fn quoted(value: &str) -> String {
+    format!("`{}`", value.escape_debug())
+}
+
+fn invalid(name: &str, detail: String) -> Error {
+    Error::InvalidArgument {
+        name: name.to_string(),
+        detail,
+    }
+}
+
+/// Parse the required `rev=` argument. Like [`parse_pr`] this is a flag guard:
+/// the value is positional in git's argv, and a `--output=` must never get there.
+fn parse_rev<'a>(inv: &'a Invocation<'_>) -> Result<&'a str> {
+    let rev = inv.inline_str("rev")?;
+    if rev.is_empty() || rev.starts_with('-') || rev.contains('\0') {
+        return Err(invalid(
+            "rev",
+            format!(
+                "{} is not a revision: give a commit hash, branch or tag",
+                quoted(rev)
+            ),
+        ));
+    }
+    Ok(rev)
+}
+
+/// Parse the required `path=` argument: a file's name in a commit's tree,
+/// relative to the repository's root. A path that a tree cannot hold is refused
+/// here, so that what reaches git is only ever a question about the tree.
+fn parse_show_path<'a>(inv: &'a Invocation<'_>) -> Result<&'a str> {
+    let path = inv.inline_str("path")?;
+    let in_tree = !path.is_empty()
+        && !path.starts_with(['-', '/'])
+        && !path.contains('\0')
+        && !path.split('/').any(|segment| matches!(segment, "." | ".."));
+    if !in_tree {
+        return Err(invalid(
+            "path",
+            format!(
+                "{} is not a file path relative to the repository root",
+                quoted(path)
+            ),
+        ));
+    }
+    Ok(path)
+}
+
+/// The blob `git ls-tree -z` lists under exactly `path`, if there is one. A
+/// directory or a submodule is listed too, and it is not a file; `vocab/` lists
+/// `vocab`'s children, and `a//b` lists `a/b`, under names that are not `path`.
+fn blob_in_listing<'a>(listing: &'a [u8], path: &str) -> Option<&'a str> {
+    listing.split(|byte| *byte == 0).find_map(|entry| {
+        let tab = entry.iter().position(|byte| *byte == b'\t')?;
+        if &entry[tab + 1..] != path.as_bytes() {
+            return None;
+        }
+        let mut fields = std::str::from_utf8(&entry[..tab]).ok()?.split(' ');
+        let (_mode, kind, object) = (fields.next()?, fields.next()?, fields.next()?);
+        (kind == "blob").then_some(object)
+    })
+}
+
+/// `urn:repo:show` — a file's bytes at a commit, or [`Error::NotFound`] if the
+/// rev names no commit or the path is not a file there.
+///
+/// Three fixed steps rather than `git show <rev>:<path>`, because a miss has to
+/// be told from a failure: as-of resolution (`ikigai-name`'s `repo_history`) reads
+/// `NotFound` as "it did not exist then", so an unreadable repository must not
+/// answer it, and git's exit status says which only for `rev-parse --quiet` and an
+/// empty listing. The steps also keep a value in its own place. The rev is resolved
+/// alone, so a `:` in it cannot choose the file. The path is matched literally from
+/// the root (`--literal-pathspecs --full-tree`), never as a pattern. The blob is read
+/// by its hash with `cat-file`, which runs no textconv or filter a repository's
+/// configuration names, and has no `--output=`.
+///
+/// The answer is a repository's raw bytes, which may not be text, so they are never
+/// decoded; git records no media type, so it is `application/octet-stream`. Collected
+/// under [`MAX_OUTPUT_BYTES`], not streamed: a file is refused whole past that limit.
+/// Live like every read here, even for a full hash: see `tests/conformance.rs`.
+fn show(roots: Roots) -> FnEndpoint {
+    FnEndpoint::new("repo-show", move |inv: &Invocation<'_>| {
+        let rev = parse_rev(inv)?;
+        let path = parse_show_path(inv)?;
+        let dir = inv.inline_str("dir").ok();
+        let git = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            run_output(inv, "git", &args, dir, &roots)
+        };
+
+        let commit = format!("{rev}^{{commit}}");
+        let resolved = git(&["rev-parse", "--verify", "--quiet", &commit])?;
+        if !resolved.status.success() {
+            // `--quiet` makes 1 the exit for "no such commit"; anything else, such
+            // as 128 for "not a git repository", is git failing, not a miss.
+            return Err(if resolved.status.code() == Some(1) {
+                Error::NotFound(format!(
+                    "rev {} does not name a commit in this repository",
+                    quoted(rev)
+                ))
+            } else {
+                tool_failed("git", &resolved)
+            });
+        }
+        let stdout = String::from_utf8_lossy(&resolved.stdout);
+        let commit = stdout.trim();
+
+        let listing = git(&[
+            "--literal-pathspecs",
+            "ls-tree",
+            "--full-tree",
+            "-z",
+            commit,
+            "--",
+            path,
+        ])?;
+        if !listing.status.success() {
+            return Err(tool_failed("git", &listing));
+        }
+        let Some(blob) = blob_in_listing(&listing.stdout, path) else {
+            return Err(Error::NotFound(format!(
+                "path {} is not a file at commit {commit}",
+                quoted(path)
+            )));
+        };
+
+        let file = git(&["cat-file", "blob", blob])?;
+        if !file.status.success() {
+            return Err(tool_failed("git", &file));
+        }
+        Ok(Representation::new(
+            ReprType::new("application/octet-stream"),
+            file.stdout,
+        ))
+    })
+    .with_description(
+        Description::new("repo-show")
+            .title("A file at a commit")
+            .summary(
+                "The bytes of one file as it stood at a commit (git cat-file), unchanged. \
+                 NotFound if rev= names no commit or path= is not a file at that commit. Refused \
+                 whole past the 8 MiB output limit. Pair with urn:repo:log path= to pick the \
+                 commit.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .requires("urn:cap:exec:git")
+            .input(
+                ArgSpec::new("rev")
+                    .class(XSD_STRING)
+                    .summary("the commit to read from: a commit hash, branch or tag"),
+            )
+            .input(
+                ArgSpec::new("path")
+                    .class(XSD_STRING)
+                    .summary("the file to read, relative to the repository root, taken literally"),
+            )
+            .input(dir_arg(
+                "the repository directory (defaults to the process cwd)",
+            ))
+            .output("application/octet-stream"),
+    )
+}
+
 /// Where `urn:repo:list` scans, in priority order: an explicit `root=` arg,
 /// then the `IKIGAI_REPO_ROOT` env var (the IKIGAI_* config convention), then
 /// `~/git-personal` — this ecosystem's home for its sibling repos.
@@ -992,6 +1173,7 @@ fn bind(roots: Roots) -> EndpointSpace {
             ),
         )
         .bind(Exact::new("urn:repo:log"), log(roots.clone()))
+        .bind(Exact::new("urn:repo:show"), show(roots.clone()))
         .bind(
             Exact::new("urn:repo:branch"),
             git_facade(
@@ -1341,6 +1523,305 @@ mod tests {
 
     /// The three git facades, each with the minimal arguments it runs on.
     const GIT_IRIS: [&str; 3] = ["urn:repo:status", "urn:repo:branch", "urn:repo:log"];
+
+    /// A scratch repository with a dated history of one file, for `urn:repo:show`.
+    struct History {
+        _base: Base,
+        root: std::path::PathBuf,
+        repo: std::path::PathBuf,
+    }
+
+    impl History {
+        fn new(name: &str) -> Self {
+            let base = Base::new(name);
+            let root = base.dir("root");
+            let repo = base.repo("root/repo");
+            History {
+                _base: base,
+                root,
+                repo,
+            }
+        }
+
+        fn dir(&self) -> &str {
+            self.repo.to_str().unwrap()
+        }
+
+        fn git(&self, args: &[&str]) -> String {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&self.repo)
+                .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        }
+
+        /// Commit `bytes` at `path`, answering the commit's full hash.
+        fn commit(&self, path: &str, bytes: &[u8]) -> String {
+            let file = self.repo.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, bytes).unwrap();
+            self.git(&["add", "--", path]);
+            self.git(&["commit", "-q", "-m", path]);
+            self.git(&["rev-parse", "HEAD"])
+        }
+
+        fn show(&self, rev: &str, path: &str) -> Result<Representation> {
+            self.show_as(rev, path, &git_cap())
+        }
+
+        fn show_as(&self, rev: &str, path: &str, cap: &Capability) -> Result<Representation> {
+            source_under(
+                &[self.root.as_path()],
+                "urn:repo:show",
+                &[("dir", self.dir()), ("rev", rev), ("path", path)],
+                cap,
+            )
+        }
+    }
+
+    /// The file as it stood at each commit, not as it stands now.
+    #[test]
+    fn show_answers_the_file_as_it_stood_at_the_commit() {
+        let repo = History::new("show-at");
+        let first = repo.commit("vocab/core.ttl", b"version 1\n");
+        let second = repo.commit("vocab/core.ttl", b"version 2\n");
+        std::fs::write(repo.repo.join("vocab/core.ttl"), b"uncommitted\n").unwrap();
+        for (rev, want) in [
+            (first.as_str(), &b"version 1\n"[..]),
+            (second.as_str(), &b"version 2\n"[..]),
+            ("HEAD", &b"version 2\n"[..]),
+            ("HEAD~1", &b"version 1\n"[..]),
+        ] {
+            let out = repo.show(rev, "vocab/core.ttl").unwrap();
+            assert_eq!(out.bytes, want, "{rev}");
+            assert_eq!(out.repr_type.media_type, "application/octet-stream");
+        }
+    }
+
+    /// The answer is the blob's bytes: not lossily decoded, not line-converted.
+    #[test]
+    fn show_answers_the_exact_bytes() {
+        let repo = History::new("show-bytes");
+        let bytes = [0xff, 0xfe, 0x00, b'\r', b'\n', 0x80, b'x'];
+        repo.commit("blob.bin", &bytes);
+        assert_eq!(repo.show("HEAD", "blob.bin").unwrap().bytes, bytes);
+    }
+
+    /// What ikigai-name's `repo_history` relies on: a path absent at the commit,
+    /// though it exists elsewhere in history, is `NotFound`, and so is a rev that
+    /// names no commit. Each refusal names the argument and quotes the value.
+    #[test]
+    fn show_refuses_a_path_or_rev_that_does_not_exist() {
+        let repo = History::new("show-absent");
+        let before = repo.git(&["rev-parse", "HEAD"]);
+        let added = repo.commit("vocab/core.ttl", b"here\n");
+        repo.git(&["rm", "-q", "--", "vocab/core.ttl"]);
+        repo.git(&["commit", "-q", "-m", "removed"]);
+        for rev in [before.as_str(), "HEAD"] {
+            let err = repo.show(rev, "vocab/core.ttl").unwrap_err();
+            assert!(matches!(err, Error::NotFound(_)), "{rev}: {err:?}");
+            let message = err.to_string();
+            assert!(
+                message.contains("path") && message.contains("`vocab/core.ttl`"),
+                "{message}"
+            );
+        }
+        assert!(repo.show(&added, "vocab/core.ttl").is_ok());
+
+        let zeros = "0".repeat(40);
+        for rev in [
+            "no-such-branch",
+            zeros.as_str(),
+            "HEAD..HEAD",
+            // These resolve to objects, but not to commits.
+            "HEAD^{tree}",
+            &format!("{added}:vocab/core.ttl"),
+        ] {
+            let err = repo.show(rev, "vocab/core.ttl").unwrap_err();
+            assert!(matches!(err, Error::NotFound(_)), "{rev}: {err:?}");
+            let message = err.to_string();
+            assert!(
+                message.contains("rev") && message.contains(&format!("`{rev}`")),
+                "{message}"
+            );
+        }
+    }
+
+    /// Only a file is a file: a directory or a submodule at the path is not one.
+    /// A symlink answers its stored target and is never followed out of the repo.
+    #[test]
+    fn show_reads_only_what_the_commit_stores_as_a_file() {
+        let repo = History::new("show-kinds");
+        repo.commit("vocab/core.ttl", b"here\n");
+        let err = repo.show("HEAD", "vocab").unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+        let err = repo.show("HEAD", "vocab/").unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+
+        let head = repo.git(&["rev-parse", "HEAD"]);
+        repo.git(&[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{head},sub"),
+        ]);
+        repo.git(&["commit", "-q", "-m", "submodule"]);
+        let err = repo.show("HEAD", "sub").unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/etc/passwd", repo.repo.join("link")).unwrap();
+            repo.git(&["add", "--", "link"]);
+            repo.git(&["commit", "-q", "-m", "link"]);
+            assert_eq!(repo.show("HEAD", "link").unwrap().bytes, b"/etc/passwd");
+        }
+    }
+
+    /// A path is a name in the commit's tree, relative to the repository's root,
+    /// whichever directory the call runs in, and never a pattern.
+    #[test]
+    fn show_takes_a_path_literally_from_the_repository_root() {
+        let repo = History::new("show-literal");
+        repo.commit("vocab/core.ttl", b"core\n");
+        repo.commit("we:ird*[name]", b"weird\n");
+        assert_eq!(
+            repo.show("HEAD", "we:ird*[name]").unwrap().bytes,
+            b"weird\n"
+        );
+        for path in [
+            "vocab/*.ttl",
+            "we*",
+            ":(top)vocab/core.ttl",
+            ":/vocab/core.ttl",
+            "vocab//core.ttl",
+            "core.ttl",
+        ] {
+            let err = repo.show("HEAD", path).unwrap_err();
+            assert!(matches!(err, Error::NotFound(_)), "{path}: {err:?}");
+        }
+        let subdir = repo.repo.join("vocab");
+        let out = source_under(
+            &[repo.root.as_path()],
+            "urn:repo:show",
+            &[
+                ("dir", subdir.to_str().unwrap()),
+                ("rev", "HEAD"),
+                ("path", "vocab/core.ttl"),
+            ],
+            &git_cap(),
+        )
+        .unwrap();
+        assert_eq!(out.bytes, b"core\n");
+    }
+
+    /// Nothing that could be read as a flag or leave the tree reaches git, and
+    /// `git show --output=` in particular would write a file. Refused by name.
+    #[test]
+    fn show_refuses_flags_and_paths_out_of_the_tree() {
+        let repo = History::new("show-refuse");
+        repo.commit("vocab/core.ttl", b"core\n");
+        let written = repo.repo.join("written");
+        let output = format!("--output={}", written.display());
+        for rev in ["", "-x", "--all", output.as_str(), "HE\0AD"] {
+            let err = repo.show(rev, "vocab/core.ttl").unwrap_err();
+            let Error::InvalidArgument { name, .. } = &err else {
+                panic!("{rev:?}: {err:?}");
+            };
+            assert_eq!(name, "rev", "{rev:?}");
+        }
+        for path in [
+            "",
+            "-x",
+            "/etc/passwd",
+            "../secrets",
+            "vocab/../../secrets",
+            "./vocab/core.ttl",
+            "vocab/./core.ttl",
+            "vo\0cab",
+        ] {
+            let err = repo.show("HEAD", path).unwrap_err();
+            let Error::InvalidArgument { name, .. } = &err else {
+                panic!("{path:?}: {err:?}");
+            };
+            assert_eq!(name, "path", "{path:?}");
+        }
+        assert!(!written.exists(), "a rev must never reach git as a flag");
+    }
+
+    #[test]
+    fn show_requires_its_arguments_and_the_git_grant() {
+        let repo = History::new("show-gate");
+        repo.commit("vocab/core.ttl", b"core\n");
+        let roots = [repo.root.as_path()];
+        for (args, missing) in [
+            (vec![("dir", repo.dir()), ("path", "vocab/core.ttl")], "rev"),
+            (vec![("dir", repo.dir()), ("rev", "HEAD")], "path"),
+        ] {
+            let err = source_under(&roots, "urn:repo:show", &args, &git_cap()).unwrap_err();
+            match err {
+                Error::MissingArgument(name) => assert!(name.starts_with(missing), "{name}"),
+                err => panic!("{missing}: {err:?}"),
+            }
+        }
+        let gh = Capability::scoped(["urn:cap:exec:gh"]);
+        assert_denied(repo.show_as("HEAD", "vocab/core.ttl", &gh), "no git grant");
+
+        let outside = Base::new("show-outside");
+        let held = outside.repo("repo");
+        assert_denied(
+            source_under(
+                &roots,
+                "urn:repo:show",
+                &[
+                    ("dir", held.to_str().unwrap()),
+                    ("rev", "HEAD"),
+                    ("path", "vocab/core.ttl"),
+                ],
+                &git_cap(),
+            ),
+            "a dir outside every root",
+        );
+    }
+
+    /// A broken place to read is not a missing file: git's own failure reaches the
+    /// caller rather than reading as "it did not exist then".
+    #[test]
+    fn show_outside_a_repository_is_a_tool_failure_not_a_miss() {
+        let base = Base::new("show-norepo");
+        let root = base.dir("root");
+        let err = source_under(
+            &[&root],
+            "urn:repo:show",
+            &[
+                ("dir", root.to_str().unwrap()),
+                ("rev", "HEAD"),
+                ("path", "x"),
+            ],
+            &git_cap(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Endpoint(_)), "{err:?}");
+        assert!(err.to_string().contains("not a git repository"), "{err}");
+    }
+
+    /// The same bound as every collected answer: refused whole past the limit.
+    #[test]
+    fn show_refuses_a_file_over_the_output_limit() {
+        let repo = History::new("show-budget");
+        repo.commit("big", &vec![b'x'; MAX_OUTPUT_BYTES + 1]);
+        repo.commit("fits", &vec![b'x'; MAX_OUTPUT_BYTES]);
+        assert_eq!(
+            repo.show("HEAD", "fits").unwrap().bytes.len(),
+            MAX_OUTPUT_BYTES
+        );
+        let err = repo.show("HEAD", "big").unwrap_err();
+        assert!(matches!(err, Error::OverBudget { .. }), "{err:?}");
+    }
 
     /// In a root, the facades run: the root itself and a repository below it.
     #[test]
