@@ -76,7 +76,7 @@ use std::sync::Arc;
 
 use ikigai_core::{
     space_iri, ArgSpec, Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation, ReprType,
-    Representation, Result, Verb,
+    Representation, Result, UriTemplate, Verb,
 };
 
 /// The tools [`run`] will spawn. Anything else is refused before a process is
@@ -882,6 +882,189 @@ fn blob_in_listing<'a>(listing: &'a [u8], path: &str) -> Option<&'a str> {
     })
 }
 
+/// Object identities are immutable; provenance is relative to retained, reachable
+/// history. Hosts can cut the repository's object-history thread after fetching
+/// history or rewriting refs to refresh that part of an indefinitely cached answer.
+fn object(roots: Roots) -> FnEndpoint {
+    FnEndpoint::new("repo-object", move |inv: &Invocation<'_>| {
+        object_lookup(inv, &roots)
+    })
+    .with_description(
+        Description::new("repo-object")
+            .title("A Git object")
+            .summary(
+                "A local object by full SHA: commit, tree, blob or tag. For a blob, the first \
+                 retained reachable commit and path in reverse topological history \
+                 (git log --all --find-object); null if unavailable. Present answers never \
+                 expire; absence has a five-second upper bound. dir= selects the repository, \
+                 whose directory name must match {repo}.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .requires("urn:cap:exec:git")
+            .input(ArgSpec::new("repo").binding().class(XSD_STRING)
+                .summary("the repository directory name, in the resource IRI"))
+            .input(ArgSpec::new("sha").binding().class(XSD_STRING)
+                .summary("a full SHA in the resource IRI: 40 or 64 hexadecimal digits"))
+            .input(dir_arg("the repository directory (defaults to the process cwd)"))
+            .input(ArgSpec::new("as").class(XSD_STRING)
+                .summary("application/json for sha, type and firstAppearance (commit and path, or null)")
+                .one_of(["application/json"]).optional())
+            .output("text/plain;charset=utf-8")
+            .output("application/json"),
+    )
+}
+
+fn object_lookup(inv: &Invocation<'_>, roots: &[PathBuf]) -> Result<Representation> {
+    if !inv.capability.allows("urn:cap:exec:git") {
+        return Err(Error::Denied(
+            "exec: capability does not grant `urn:cap:exec:git`".into(),
+        ));
+    }
+    let sha = inv
+        .bindings
+        .get("sha")
+        .ok_or_else(|| Error::MissingArgument("sha".into()))?;
+    if !matches!(sha.len(), 40 | 64) || !sha.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err(invalid(
+            "sha",
+            format!(
+                "{} must be a full SHA: 40 or 64 hexadecimal digits",
+                quoted(sha)
+            ),
+        ));
+    }
+    let sha = sha.to_ascii_lowercase();
+    let repo = inv
+        .bindings
+        .get("repo")
+        .ok_or_else(|| Error::MissingArgument("repo".into()))?;
+    let dir = inv.inline_str("dir").ok();
+    let git = |args: &[&str]| {
+        let mut fixed = vec!["--no-replace-objects".to_string()];
+        fixed.extend(args.iter().map(|a| a.to_string()));
+        let mut command = prepare_command(inv, "git", &fixed, dir, roots)?;
+        // A local lookup must not fetch a promisor's missing objects.
+        command.env("GIT_NO_LAZY_FETCH", "1");
+        let output = bounded_output(&mut command, "git")?;
+        Ok::<_, Error>(output)
+    };
+    let top = git(&["rev-parse", "--show-toplevel"])?;
+    if !top.status.success() {
+        return Err(tool_failed("git", &top));
+    }
+    let top = String::from_utf8_lossy(&top.stdout);
+    if Path::new(top.strip_suffix('\n').unwrap_or(&top))
+        .file_name()
+        .and_then(|s| s.to_str())
+        != Some(repo)
+    {
+        return Err(invalid(
+            "repo",
+            format!(
+                "{} must name the repository directory at dir= or the process cwd",
+                quoted(repo)
+            ),
+        ));
+    }
+    let resolved = git(&[
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("{sha}^{{object}}"),
+    ])?;
+    if !resolved.status.success() && resolved.status.code() != Some(1) {
+        return Err(tool_failed("git", &resolved));
+    }
+    // In a SHA-1 repository, 64 hex digits can name a ref; in a SHA-256
+    // repository, 40 can abbreviate an object. Neither is the requested object.
+    if !resolved.status.success()
+        || resolved
+            .stdout
+            .strip_suffix(b"\n")
+            .unwrap_or(&resolved.stdout)
+            != sha.as_bytes()
+    {
+        inv.failure_expires_in(std::time::Duration::from_secs(5));
+        return Err(Error::NotFound(format!(
+            "sha {} is not held in this repository (absence expires after 5 seconds)",
+            quoted(&sha)
+        )));
+    }
+    let kind = git(&["cat-file", "-t", &sha])?;
+    if !kind.status.success() {
+        return Err(tool_failed("git", &kind));
+    }
+    let kind = String::from_utf8_lossy(&kind.stdout);
+    let kind = kind.trim();
+    let mut introduction = None;
+    if kind == "blob" {
+        let history = git(&[
+            "log",
+            "--all",
+            "--reverse",
+            "--topo-order",
+            "--root",
+            "-m",
+            "--format=%H",
+            &format!("--find-object={sha}"),
+            "--",
+        ])?;
+        if !history.status.success() {
+            return Err(tool_failed("git", &history));
+        }
+        for commit in String::from_utf8_lossy(&history.stdout).lines() {
+            let tree = git(&["ls-tree", "-r", "--full-tree", "-z", commit])?;
+            if !tree.status.success() {
+                return Err(tool_failed("git", &tree));
+            }
+            let path = tree.stdout.split(|b| *b == 0).find_map(|entry| {
+                let tab = entry.iter().position(|b| *b == b'\t')?;
+                let header = std::str::from_utf8(&entry[..tab]).ok()?;
+                (header.split(' ').nth(2) == Some(sha.as_str())).then_some(&entry[tab + 1..])
+            });
+            if let Some(path) = path {
+                let path = std::str::from_utf8(path).map_err(|_| {
+                    Error::Endpoint("object path is not UTF-8; no output returned".into())
+                })?;
+                introduction = Some((commit.to_string(), path.to_string()));
+                break;
+            }
+        }
+    }
+    let repr = if wants_json(inv) {
+        let first = introduction
+            .as_ref()
+            .map(|(commit, path)| {
+                format!(
+                    "{{\"commit\":{},\"path\":{}}}",
+                    json_str(commit),
+                    json_str(path)
+                )
+            })
+            .unwrap_or_else(|| "null".into());
+        json(format!(
+            "{{\"sha\":{},\"type\":{},\"firstAppearance\":{first}}}",
+            json_str(&sha),
+            json_str(kind)
+        ))
+    } else {
+        let mut body = format!("SHA: {sha}\nType: {kind}\n");
+        if let Some((commit, path)) = &introduction {
+            body.push_str(&format!(
+                "First commit: {commit}\nPath (JSON string): {}\n",
+                json_str(path)
+            ));
+        } else if kind == "blob" {
+            body.push_str("First appearance: not found in reachable history\n");
+        }
+        text(body)
+    };
+    Ok(repr
+        .cacheable()
+        .depends_on(format!("urn:repo:{repo}:object-history")))
+}
+
 /// `urn:repo:show` — a file's bytes at a commit, or [`Error::NotFound`] if the
 /// rev names no commit or the path is not a file there.
 ///
@@ -898,7 +1081,7 @@ fn blob_in_listing<'a>(listing: &'a [u8], path: &str) -> Option<&'a str> {
 /// The answer is a repository's raw bytes, which may not be text, so they are never
 /// decoded; git records no media type, so it is `application/octet-stream`. Collected
 /// under [`MAX_OUTPUT_BYTES`], not streamed: a file is refused whole past that limit.
-/// Live like every read here, even for a full hash: see `tests/conformance.rs`.
+/// Live like the other revision-based reads, even for a full hash.
 fn show(roots: Roots) -> FnEndpoint {
     FnEndpoint::new("repo-show", move |inv: &Invocation<'_>| {
         let rev = parse_rev(inv)?;
@@ -1174,6 +1357,10 @@ fn bind(roots: Roots) -> EndpointSpace {
         )
         .bind(Exact::new("urn:repo:log"), log(roots.clone()))
         .bind(Exact::new("urn:repo:show"), show(roots.clone()))
+        .bind(
+            UriTemplate::parse("urn:repo:{repo}:object:sha:{sha}").expect("fixed object template"),
+            object(roots.clone()),
+        )
         .bind(
             Exact::new("urn:repo:branch"),
             git_facade(
@@ -1581,6 +1768,263 @@ mod tests {
                 cap,
             )
         }
+    }
+
+    #[test]
+    fn object_lookup_resolves_a_full_commit_sha() {
+        let repo = History::new("object-reproduction");
+        let sha = repo.commit("file.txt", b"hello\n");
+        let out = source_under(
+            &[repo.root.as_path()],
+            &format!("urn:repo:repo:object:sha:{sha}"),
+            &[("dir", repo.dir()), ("as", "application/json")],
+            &git_cap(),
+        )
+        .unwrap();
+        let body = String::from_utf8(out.bytes).unwrap();
+        assert!(body.contains("\"type\":\"commit\""), "{body}");
+    }
+
+    impl History {
+        fn object(&self, sha: &str, face: &str) -> Result<Representation> {
+            source_under(
+                &[self.root.as_path()],
+                &format!("urn:repo:repo:object:sha:{sha}"),
+                &[("dir", self.dir()), ("as", face)],
+                &git_cap(),
+            )
+        }
+    }
+
+    #[test]
+    fn object_types_and_faces_in_a_scratch_repository() {
+        let repo = History::new("object-types");
+        let path = "sub/quote\"\t\n.txt";
+        let commit = repo.commit(path, b"original\n");
+        let blob = repo.git(&["rev-parse", &format!("HEAD:{path}")]);
+        let tree = repo.git(&["rev-parse", "HEAD^{tree}"]);
+        repo.git(&[
+            "-c",
+            "tag.gpgSign=false",
+            "tag",
+            "-a",
+            "v1",
+            "-m",
+            "annotated",
+        ]);
+        let tag = repo.git(&["rev-parse", "v1"]);
+        // Removal and later reuse must not replace the original introduction.
+        repo.commit(path, b"replacement\n");
+        repo.commit("later.txt", b"original\n");
+        for (sha, kind) in [
+            (&commit, "commit"),
+            (&tree, "tree"),
+            (&tag, "tag"),
+            (&blob, "blob"),
+        ] {
+            let out = repo.object(sha, "application/json").unwrap();
+            assert_eq!(out.repr_type.media_type, "application/json");
+            assert_eq!(out.expiry, ikigai_core::Expiry::Never);
+            let first = if kind == "blob" {
+                format!(
+                    "{{\"commit\":{},\"path\":{}}}",
+                    json_str(&commit),
+                    json_str(path)
+                )
+            } else {
+                "null".into()
+            };
+            assert_eq!(
+                String::from_utf8(out.bytes).unwrap(),
+                format!(
+                    "{{\"sha\":{},\"type\":{},\"firstAppearance\":{first}}}",
+                    json_str(sha),
+                    json_str(kind)
+                )
+            );
+            let out = repo.object(&sha.to_uppercase(), "text/plain").unwrap();
+            assert!(out.repr_type.media_type.starts_with("text/plain"));
+            let body = String::from_utf8(out.bytes).unwrap();
+            assert!(
+                body.contains(&format!("SHA: {sha}\nType: {kind}\n")),
+                "{body}"
+            );
+            if kind == "blob" {
+                assert!(
+                    body.contains(&format!(
+                        "First commit: {commit}\nPath (JSON string): {}\n",
+                        json_str(path)
+                    )),
+                    "{body}"
+                );
+                assert!(!body.contains('\t'));
+            }
+        }
+        // A stored object need not occur in any reachable commit.
+        std::fs::write(repo.repo.join("untracked"), b"unreferenced").unwrap();
+        let dangling = repo.git(&["hash-object", "-w", "untracked"]);
+        let out = repo.object(&dangling, "application/json").unwrap();
+        assert!(String::from_utf8(out.bytes)
+            .unwrap()
+            .contains("\"firstAppearance\":null"));
+    }
+
+    #[test]
+    fn object_finds_a_blob_introduced_by_a_merge() {
+        let repo = History::new("object-merge");
+        repo.commit("file", b"base");
+        let main = repo.git(&["symbolic-ref", "--short", "HEAD"]);
+        repo.git(&["checkout", "-q", "-b", "side"]);
+        repo.commit("side", b"side");
+        repo.git(&["checkout", "-q", &main]);
+        repo.commit("main", b"main");
+        repo.git(&["merge", "--no-commit", "--no-ff", "side"]);
+        let merge = repo.commit("only-in-merge", b"merge blob");
+        let blob = repo.git(&["rev-parse", "HEAD:only-in-merge"]);
+        let out = repo.object(&blob, "application/json").unwrap();
+        let body = String::from_utf8(out.bytes).unwrap();
+        assert!(body.contains(&format!("\"commit\":\"{merge}\"")), "{body}");
+        assert!(body.contains("\"path\":\"only-in-merge\""), "{body}");
+    }
+
+    #[test]
+    fn object_refuses_malformed_sha_and_wrong_repository() {
+        let repo = History::new("object-invalid");
+        let sha = repo.commit("file", b"data");
+        for bad in [
+            "abc",
+            "HEAD",
+            "--all",
+            &"g".repeat(40),
+            &"a".repeat(39),
+            &"a".repeat(41),
+            &"a".repeat(63),
+            &"a".repeat(65),
+        ] {
+            let err = repo.object(bad, "application/json").unwrap_err();
+            match err {
+                Error::InvalidArgument { name, detail } => {
+                    assert_eq!(name, "sha");
+                    assert!(detail.contains("40 or 64 hexadecimal digits"), "{detail}");
+                }
+                err => panic!("{bad}: {err:?}"),
+            }
+        }
+        let err = source_under(
+            &[&repo.root],
+            &format!("urn:repo:other:object:sha:{sha}"),
+            &[("dir", repo.dir())],
+            &git_cap(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument { name, .. } if name == "repo"));
+        for absent in ["0".repeat(40), "0".repeat(64)] {
+            let err = repo.object(&absent, "application/json").unwrap_err();
+            assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn object_does_not_resolve_a_sha_shaped_ref_as_an_object() {
+        let repo = History::new("object-ref");
+        repo.commit("file", b"data");
+        for length in [40, 64] {
+            let absent = "0".repeat(length);
+            repo.git(&["branch", &absent]);
+            let err = repo.object(&absent, "application/json").unwrap_err();
+            assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn object_is_gated_in_the_kernel_and_endpoint() {
+        use ikigai_core::{Bindings, Endpoint};
+        let repo = History::new("object-gated");
+        let sha = repo.commit("file", b"data");
+        let none = Capability::scoped(Vec::<String>::new());
+        let iri = format!("urn:repo:repo:object:sha:{sha}");
+        assert_denied(
+            source_under(&[&repo.root], &iri, &[("dir", repo.dir())], &none),
+            "object",
+        );
+        assert_denied(
+            source_under(&[], &iri, &[("dir", repo.dir())], &git_cap()),
+            "no roots",
+        );
+        let endpoint = object(no_roots());
+        assert!(endpoint
+            .describe()
+            .requires
+            .contains(&"urn:cap:exec:git".into()));
+        let request = Request::new(Verb::Source, Iri::parse(&iri).unwrap());
+        let mut bindings = Bindings::new();
+        bindings.insert("repo", "repo");
+        bindings.insert("sha", &sha);
+        let inv = Invocation::detached(&request, &bindings, &none);
+        assert_denied(block_on(endpoint.invoke(&inv)), "direct endpoint");
+    }
+
+    #[test]
+    fn object_absence_expires_and_presence_is_cached() {
+        use ikigai_core::{Clock, Time};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        struct TestClock(AtomicU64);
+        impl Clock for TestClock {
+            fn now(&self) -> Time {
+                Time(self.0.load(Ordering::SeqCst))
+            }
+        }
+        let repo = History::new("object-cache");
+        repo.commit("file", b"committed");
+        std::fs::write(repo.repo.join("new-blob"), b"new object").unwrap();
+        let sha = repo.git(&["hash-object", "new-blob"]);
+        let iri = format!("urn:repo:repo:object:sha:{sha}");
+        let clock = Arc::new(TestClock(AtomicU64::new(1_000)));
+        let kernel = Kernel::new(Arc::new(space_with_roots([&repo.root])))
+            .with_clock(clock.clone())
+            .with_failure_ceiling(std::time::Duration::from_secs(60));
+        let args = [("dir", repo.dir()), ("as", "application/json")];
+        assert!(matches!(
+            issue_on(&kernel, &iri, &args, &git_cap()),
+            Err(Error::NotFound(_))
+        ));
+        // Core 0.3 does not cache NotFound at all: its zero lifetime is
+        // stricter than the endpoint's stated five-second upper bound.
+        assert_eq!(kernel.cache_len(), 0);
+        clock.0.store(5_999, Ordering::SeqCst);
+        repo.git(&["hash-object", "-w", "new-blob"]);
+        let first = issue_on(&kernel, &iri, &args, &git_cap()).unwrap();
+        assert_eq!(first.expiry, ikigai_core::Expiry::Never);
+        clock.0.store(u64::MAX / 2, Ordering::SeqCst);
+        // Even after local removal, the successful immutable answer remains cached.
+        std::fs::remove_file(
+            repo.repo
+                .join(".git/objects")
+                .join(&sha[..2])
+                .join(&sha[2..]),
+        )
+        .unwrap();
+        let again = issue_on(&kernel, &iri, &args, &git_cap()).unwrap();
+        assert_eq!(first.bytes, again.bytes);
+        let none = Capability::scoped(Vec::<String>::new());
+        assert_denied(issue_on(&kernel, &iri, &args, &none), "cached object");
+    }
+
+    #[test]
+    fn object_supports_sha256_repositories() {
+        let repo = History::new("object-sha256");
+        // Reinitialize before creating any objects; Git supports SHA-256 in CI.
+        std::fs::remove_dir_all(repo.repo.join(".git")).unwrap();
+        repo.git(&["init", "-q", "--object-format=sha256"]);
+        let sha = repo.commit("file", b"sha256");
+        assert_eq!(sha.len(), 64);
+        let err = repo.object(&sha[..40], "application/json").unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+        let blob = repo.git(&["rev-parse", "HEAD:file"]);
+        let out = repo.object(&blob, "application/json").unwrap();
+        assert!(String::from_utf8(out.bytes)
+            .unwrap()
+            .contains(&format!("\"commit\":\"{sha}\"")));
     }
 
     /// The file as it stood at each commit, not as it stands now.
