@@ -1,7 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.5.0
 
+- Add `urn:repo:{repo}:object:sha:{sha}`: whether a repository holds a git object by its full
+  SHA (40 or 64 hex digits), its type (commit, tree, blob, tag) and, for a blob, the commit that
+  introduced it and its path there. Under `urn:cap:exec:git`; a present answer never expires and
+  hangs on the repository's object-history thread; an absent one is `NotFound`. For gonk's links
+  from commit and blob IRIs into code (ledger #3204, #3198).
 - Add `urn:repo:show` (`dir`, `rev`, `path`): a file's exact bytes at a commit,
   under `urn:cap:exec:git`, confined to the roots like every `dir=`. A rev that
   names no commit and a path that is not a file at that commit answer typed
