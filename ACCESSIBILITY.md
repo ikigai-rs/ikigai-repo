@@ -12,7 +12,7 @@ git's and gh's own; this file says which. It is not a conformance claim. Adapted
 | Status | Evaluation in progress. No conformance claim. |
 | Owner | the maintainers of this repository |
 | Report a barrier | [a GitHub issue](https://github.com/ikigai-rs/ikigai-repo/issues/new?labels=accessibility) with the `accessibility` label; anything security-sensitive through [private vulnerability reporting](https://github.com/ikigai-rs/ikigai-repo/security/advisories/new) |
-| Last reviewed | 2026-11-03 |
+| Last reviewed | 2026-11-06 |
 
 ## What it emits that people read
 
@@ -26,7 +26,12 @@ All of it is in `src/lib.rs` unless named otherwise.
 - **Text faces this crate shapes**: `urn:repo:pr:list` (one PR per line, `number`, `title`,
   `state`, `branch`, `updated` separated by tabs, through a gh template), `urn:repo:pr:files`
   (one path per line) and `urn:repo:list` (`name`, a tab, `path`). The JSON faces
-  (`as=application/json`) are for programs.
+  (`as=application/json`) are for programs. The object resource
+  (`urn:repo:{repo}:object:sha:{sha}`) labels `SHA`, `Type`, `First commit` and
+  `Path (JSON string)` on separate lines. The path is JSON-quoted so tabs,
+  newlines and other control characters stay visible. A blob with no known
+  introduction says `First appearance: not found in reachable history`. Its JSON
+  face uses `sha`, `type` and `firstAppearance` (a commit and path, or `null`).
 - **Refusals and errors**: a capability that does not grant `urn:cap:exec:git` or
   `urn:cap:exec:gh`, a `dir=` or explicit list `root=` outside the configured roots, a `limit`, `pr` or `state` that is
   not a valid value (`state must be one of open, closed, merged, all, got …`), a `path` that is
@@ -34,6 +39,13 @@ All of it is in `src/lib.rs` unless named otherwise.
   does not name a commit in this repository``, ``path `…` is not a file at commit …``), output
   past the 8 MiB limit, and a tool that failed: `` exec: `git` exited N: `` and
   then the tool's own stderr (`src/process_body.rs` does the same for a streamed answer).
+- **Object lookup refusals**: malformed `sha` values are `InvalidArgument` and name
+  the form (`must be a full SHA: 40 or 64 hexadecimal digits`); a mismatched `repo`
+  names the repository directory requirement. Missing objects are `NotFound`
+  (`sha … is not held in this repository (absence expires after 5 seconds)`).
+  These quoted values escape control characters. A non-UTF-8 object path says
+  `object path is not UTF-8; no output returned`. Capability and directory refusals,
+  tool failures and the 8 MiB per-pipe limit follow the other git reads.
 - **The facades' self-descriptions**: the summaries of every facade and argument, which a host
   shows in its catalog, help or tool list.
 - **The example** (`examples/repo-demo.rs`) prints three answers, or their errors, to a
@@ -65,6 +77,12 @@ that shows these.
   caller; `pr_list_builds_the_gh_invocation` the text face's template;
   `show_refuses_a_path_or_rev_that_does_not_exist` that those refusals name the argument and
   quote the value, and `show_refuses_flags_and_paths_out_of_the_tree` that the others name it.
+- `src/lib.rs`: `object_types_and_faces_in_a_scratch_repository` pins labeled text,
+  escaped control characters in a path, and the JSON fields for all four types;
+  `object_refuses_malformed_sha_and_wrong_repository` checks typed refusals and
+  the SHA form. `object_is_gated_in_the_kernel_and_endpoint` checks the capability
+  refusal in both layers. `object_absence_expires_and_presence_is_cached` checks
+  that a miss is not retained and a successful answer has no time expiry.
 - `src/process_body.rs`: `late_nonzero_exit_is_an_error_item_with_stderr` pins the exit status
   and the tool's stderr in a streamed failure.
 
@@ -110,3 +128,4 @@ through
 |---|---|
 | 2026-10-31 | First version. |
 | 2026-11-03 | Add `urn:repo:show`: its passed-through bytes and its refusals. |
+| 2026-11-06 | Add object lookup: labeled text, JSON-quoted paths, SHA and repository refusals, and scratch-repository tests. |

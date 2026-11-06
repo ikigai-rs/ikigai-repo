@@ -1,20 +1,17 @@
-//! The module recipe as one test: `ikigai-conformance` walks the ten endpoints
+//! The module recipe as one test: `ikigai-conformance` walks the eleven endpoints
 //! [`ikigai_repo::space`] binds and reports every violation at once.
 //!
-//! ## Nothing here is pure, and nothing is cached
+//! ## Object answers are cached; the other reads remain live
 //!
-//! Every endpoint reads a working tree, git state, a directory, or GitHub. None
-//! marks its result `.cacheable()`, so every representation is live and the
-//! suite's cache probe has nothing to hold it to — and no endpoint is declared
-//! `pure` or `cacheable` here, so the day one is marked cacheable without a
-//! golden thread it can be cut by, this test goes red.
+//! `repo-object` is declared cacheable. Its full-SHA answers never expire and
+//! carry a repository object-history thread so a host can refresh provenance
+//! after fetching history or rewriting refs. CACHEABLE, RECOMPUTE and BODIES
+//! probe that contract over an immutable scratch fixture. It is not pure:
+//! presence and the first retained appearance depend on the local repository.
 //!
-//! Why not cache a working-tree read under a thread? The host's workspace
-//! watcher cuts `urn:file:<path>` per changed file, with the path RELATIVE to a
-//! root the host configured — a root this module cannot see from an absolute
-//! `dir=`, and there is no directory-level thread that "any file under `dir`
-//! changed" could name. A thread this module minted would be a promise no host
-//! keeps. So: when in doubt, don't cache.
+//! Other reads are of mutable git state, directories or GitHub and stay live.
+//! A workspace watcher cuts relative file paths, not repository-wide state,
+//! so these endpoints do not promise cache invalidation they cannot implement.
 //!
 //! ## The fixture kernel: a hermetic scratch repository
 //!
@@ -39,8 +36,8 @@
 //!
 //! ## REQUIRED on the fired actions
 //!
-//! Of the five actions the walk fires, `urn:repo:show` alone declares required
-//! inputs (`rev`, `path`), so the suite drops each in turn. REQUIRED is held on
+//! Of the six actions the walk fires, `urn:repo:show` alone declares required
+//! inline inputs (`rev`, `path`), so the suite drops each in turn. REQUIRED is held on
 //! the `pr` facades by [`pr_facades_refuse_a_missing_pr_typed`].
 //!
 //! No module namespace: there is no RDF face. NAMES runs: every id is kebab-case.
@@ -84,9 +81,10 @@ const GH_FACADES: [(&str, &str); 5] = [
 const REACHES_GITHUB: &str = "reaches api.github.com";
 
 /// Every endpoint `space()` binds: the listing, the git facades, the file reader,
-/// the GitHub facades. Each declares exactly one action (Source; Meta is the kernel's).
+/// the object lookup, and the GitHub facades. Each declares exactly one action
+/// (Source; Meta is the kernel's).
 /// There is no low-level exec among them (ledger #1706).
-const ENDPOINTS: usize = 2 + GIT_FACADES.len() + GH_FACADES.len();
+const ENDPOINTS: usize = 3 + GIT_FACADES.len() + GH_FACADES.len();
 
 /// A hermetic scratch repository under a fresh base directory, removed on drop.
 struct Scratch {
@@ -152,9 +150,28 @@ fn kernel(scratch: &Scratch) -> Kernel {
 /// every fired action reads the scratch repository, and the GitHub facades are
 /// opted out. No input consumes body bytes or declares `reads_body`, so
 /// BODY-INPUTS needs no content store. BODIES receives the kernel's shared space,
-/// but these live answers remain explicitly unprobed (pinned in `assert_shape`).
+/// the object answer is probed, while live answers remain explicitly unprobed
+/// (pinned in `assert_shape`).
 fn suite(scratch: &Scratch, space: Arc<EndpointSpace>) -> Suite {
+    let sha = Command::new("git")
+        .args([
+            "-C",
+            scratch.dir(),
+            "rev-parse",
+            &format!("HEAD:{SHOW_FILE}"),
+        ])
+        .output()
+        .unwrap();
+    assert!(sha.status.success());
+    let sha = String::from_utf8(sha.stdout).unwrap();
     let mut suite = Suite::new()
+        .cacheable("repo-object")
+        .fixture(
+            Fixture::new("repo-object", Verb::Source)
+                .binding("repo", "scratch")
+                .binding("sha", sha.trim())
+                .arg("dir", scratch.dir()),
+        )
         .body_space(space.clone())
         .self_named_space("repo", ikigai_repo::space)
         .host_named_space("space_with_roots(roots)", space)
@@ -177,7 +194,7 @@ fn suite(scratch: &Scratch, space: Arc<EndpointSpace>) -> Suite {
 /// The walk saw every endpoint, one Source action each, skipped no check
 /// (ikigai-conformance 0.12 also runs BODIES and BODY-INPUTS; the process
 /// body endpoints declare Unknown and OverBudget), and
-/// opted out exactly the GitHub facades. An eleventh endpoint bound without a
+/// opted out exactly the GitHub facades. A twelfth endpoint bound without a
 /// line here is held to a weaker standard; a listed id that binds nothing is a
 /// stale list.
 fn assert_shape(report: &Report) {
@@ -191,7 +208,8 @@ fn assert_shape(report: &Report) {
         [],
         "every check runs: {report}"
     );
-    // Every local answer is live. Permit only the suite's volatility reason:
+    // All local answers except object lookup are live. Permit only the suite's
+    // volatility reason:
     // missing body_space or any other setup gap must fail this test.
     assert_eq!(report.unprobed.len(), 2 + GIT_FACADES.len(), "{report}");
     for probe in report.unprobed.iter() {
@@ -314,7 +332,16 @@ fn declared_outputs_are_the_media_types_served() {
     let kernel = kernel(&scratch);
     let root = Capability::root();
     let dir = scratch.dir();
-    let calls: [(&str, Vec<(&str, &str)>); 6] = [
+    let sha = Command::new("git")
+        .args(["-C", dir, "rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(sha.status.success());
+    let sha = String::from_utf8(sha.stdout).unwrap();
+    let object = format!("urn:repo:scratch:object:sha:{}", sha.trim());
+    let calls: [(&str, Vec<(&str, &str)>); 8] = [
+        (&object, vec![("dir", dir)]),
+        (&object, vec![("dir", dir), ("as", "application/json")]),
         ("urn:repo:status", vec![("dir", dir)]),
         ("urn:repo:branch", vec![("dir", dir)]),
         ("urn:repo:list", vec![("root", scratch.root())]),
