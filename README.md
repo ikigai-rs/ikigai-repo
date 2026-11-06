@@ -105,7 +105,7 @@ capability gate is pinned by a test of its own.
 
 ## Changes
 
-**Unreleased (rides the next release):** `urn:system:exec` is no longer served
+**0.3.0:** `urn:system:exec` is no longer served
 (ledger #1706). It took a caller's argument vector (`tool=` + `args=` + `dir=`)
 gated only by a tool allowlist and `urn:cap:exec:{tool}`, and an argv is not a
 safe boundary for these tools: git, gh, cargo and just each have flags and
