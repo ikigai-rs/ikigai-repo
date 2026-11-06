@@ -973,10 +973,18 @@ fn object_lookup(inv: &Invocation<'_>, roots: &[PathBuf]) -> Result<Representati
         "--quiet",
         &format!("{sha}^{{object}}"),
     ])?;
-    if !resolved.status.success() {
-        if resolved.status.code() != Some(1) {
-            return Err(tool_failed("git", &resolved));
-        }
+    if !resolved.status.success() && resolved.status.code() != Some(1) {
+        return Err(tool_failed("git", &resolved));
+    }
+    // In a SHA-1 repository, 64 hex digits can name a ref; in a SHA-256
+    // repository, 40 can abbreviate an object. Neither is the requested object.
+    if !resolved.status.success()
+        || resolved
+            .stdout
+            .strip_suffix(b"\n")
+            .unwrap_or(&resolved.stdout)
+            != sha.as_bytes()
+    {
         inv.failure_expires_in(std::time::Duration::from_secs(5));
         return Err(Error::NotFound(format!(
             "sha {} is not held in this repository (absence expires after 5 seconds)",
@@ -1917,6 +1925,18 @@ mod tests {
     }
 
     #[test]
+    fn object_does_not_resolve_a_sha_shaped_ref_as_an_object() {
+        let repo = History::new("object-ref");
+        repo.commit("file", b"data");
+        for length in [40, 64] {
+            let absent = "0".repeat(length);
+            repo.git(&["branch", &absent]);
+            let err = repo.object(&absent, "application/json").unwrap_err();
+            assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+        }
+    }
+
+    #[test]
     fn object_is_gated_in_the_kernel_and_endpoint() {
         use ikigai_core::{Bindings, Endpoint};
         let repo = History::new("object-gated");
@@ -1998,6 +2018,8 @@ mod tests {
         repo.git(&["init", "-q", "--object-format=sha256"]);
         let sha = repo.commit("file", b"sha256");
         assert_eq!(sha.len(), 64);
+        let err = repo.object(&sha[..40], "application/json").unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "{err:?}");
         let blob = repo.git(&["rev-parse", "HEAD:file"]);
         let out = repo.object(&blob, "application/json").unwrap();
         assert!(String::from_utf8(out.bytes)
