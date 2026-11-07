@@ -64,6 +64,10 @@ that shows these.
 - Output past the limit is never handed over as if complete: a collected answer is refused
   whole, and the refusal states the limit and that no output is returned; a streamed answer
   (`src/process_body.rs`) ends with an error.
+- Every tool call requests plain output: git gets `-c color.ui=never`; gh gets
+  `NO_COLOR=1`, `CLICOLOR=0`, `CLICOLOR_FORCE=0`, and no `GH_FORCE_TTY` override.
+  This applies to collected and streamed answers. It does not strip control bytes from
+  repository content, such as file bytes or commit messages.
 - This crate adds no color and no terminal control codes of its own.
 
 ## How it is tested
@@ -86,6 +90,13 @@ that shows these.
 - `src/process_body.rs`: `late_nonzero_exit_is_an_error_item_with_stderr` pins the exit status
   and the tool's stderr in a streamed failure.
 
+- `src/lib.rs`: `git_facades_request_plain_output_despite_repository_color` checks status,
+  branch and log answers for ESC bytes with `color.ui=always` in a scratch repository.
+  `tests/streams.rs` checks both log paths and faces with that configuration, and a local
+  gh fixture checks the plain-output environment on collected and streamed diff calls
+  while the parent environment forces color and terminal output. The fixture does not
+  contact GitHub or test gh's own rendering.
+
 **No automated accessibility checker, browser or assistive technology has been used on this
 output.**
 
@@ -93,10 +104,6 @@ output.**
 
 Found by reading the source on 2026-10-31, not by testing:
 
-- Nothing asks git or gh for plain output (no `--no-color`, no `NO_COLOR`). They write no color
-  to a pipe by default, but a repository's git configuration (`color.ui=always`) or a forcing
-  variable in the host's environment that gh honors would put terminal color codes into the
-  answer, and this crate passes them on.
 - `urn:repo:status` answers git's porcelain format, whose meaning is in two-letter codes (` M`,
   `??`) and a `##` branch line, not in words.
 - The tab-separated faces (`pr:list`, `list`) have no header line naming their columns.
@@ -129,3 +136,4 @@ through
 | 2026-10-31 | First version. |
 | 2026-11-03 | Add `urn:repo:show`: its passed-through bytes and its refusals. |
 | 2026-11-06 | Add object lookup: labeled text, JSON-quoted paths, SHA and repository refusals, and scratch-repository tests. |
+| 2026-11-06 | Request plain git and gh output; test forced-color configuration and environment. |
