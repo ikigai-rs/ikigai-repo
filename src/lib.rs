@@ -305,6 +305,16 @@ fn prepare_command(
     // ambient: process: running git and gh is this connector's job; the tool is one of ALLOWED_TOOLS, the caller holds `urn:cap:exec:{tool}` (checked above), and its directory is confined to the host's roots
     #[allow(clippy::disallowed_methods)]
     let mut command = Command::new(tool);
+    // Tool-generated presentation must stay plain even when the host forces color.
+    if tool == "git" {
+        command.args(["-c", "color.ui=never"]);
+    } else {
+        command
+            .env("NO_COLOR", "1")
+            .env("CLICOLOR", "0")
+            .env("CLICOLOR_FORCE", "0")
+            .env_remove("GH_FORCE_TTY");
+    }
     command.args(args);
     if let Some(place) = &place {
         command.current_dir(&place.dir);
@@ -2766,6 +2776,35 @@ mod tests {
             d.outputs.iter().any(|o| o.starts_with("text/plain")),
             "{d:?}"
         );
+    }
+
+    #[test]
+    fn git_facades_request_plain_output_despite_repository_color() {
+        let base = Base::new("plain-output");
+        let repo = base.repo("repo");
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["config", "color.ui", "always"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        std::fs::write(repo.join("untracked"), "content").unwrap();
+        for iri in GIT_IRIS {
+            let out = source_under(
+                &[&base.0],
+                iri,
+                &[("dir", repo.to_str().unwrap())],
+                &git_cap(),
+            )
+            .unwrap();
+            assert!(!out.bytes.is_empty(), "{iri}: empty answer");
+            assert!(
+                !out.bytes.contains(&0x1b),
+                "{iri}: {:?}",
+                String::from_utf8_lossy(&out.bytes)
+            );
+        }
     }
 
     #[test]

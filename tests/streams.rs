@@ -16,6 +16,7 @@ impl Scratch {
         std::fs::create_dir_all(&path).unwrap();
         for args in [
             vec!["init", "-q"],
+            vec!["config", "color.ui", "always"],
             vec![
                 "-c",
                 "user.name=Test",
@@ -78,6 +79,7 @@ fn log_body_is_incremental_and_matches_bytes_in_both_faces() {
         };
         let inv = ikigai_core::Invocation::detached(&request, &resolved.bindings, &root);
         let expected = block_on(resolved.endpoint.invoke(&inv)).unwrap();
+        assert!(!expected.bytes.contains(&0x1b), "{:?}", expected.bytes);
         let answer = block_on(kernel.issue_body(request.clone(), &root)).unwrap();
         assert!(
             matches!(answer.bytes, Body::Once(_)),
@@ -133,7 +135,18 @@ fn pr_diff_body_matches_bytes_without_reaching_github() {
             .join("target/gh-stream-fixture");
         std::fs::create_dir_all(&base).unwrap();
         let gh = base.join("gh");
-        std::fs::write(&gh, "#!/bin/sh\n[ \"$*\" = 'pr diff 42 --repo owner/name' ] || exit 9\nprintf 'diff --git a/file b/file\\n+hello \\377\\n'\n").unwrap();
+        std::fs::write(
+            &gh,
+            r#"#!/bin/sh
+[ "$NO_COLOR" = 1 ] || exit 10
+[ "$CLICOLOR" = 0 ] || exit 11
+[ "$CLICOLOR_FORCE" = 0 ] || exit 12
+[ "${GH_FORCE_TTY+x}" != x ] || exit 13
+[ "$*" = 'pr diff 42 --repo owner/name' ] || exit 9
+printf 'diff --git a/file b/file\n+hello \377\n'
+"#,
+        )
+        .unwrap();
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut paths = vec![base.clone()];
         paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
@@ -146,6 +159,10 @@ fn pr_diff_body_matches_bytes_without_reaching_github() {
                 "--nocapture",
             ])
             .env(MARKER, "1")
+            .env("NO_COLOR", "")
+            .env("CLICOLOR", "1")
+            .env("CLICOLOR_FORCE", "1")
+            .env("GH_FORCE_TTY", "80")
             .env("PATH", std::env::join_paths(paths).unwrap())
             .status()
             .unwrap();
