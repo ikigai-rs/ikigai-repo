@@ -2458,6 +2458,165 @@ mod tests {
         assert!(out.is_ok(), "{out:?}");
     }
 
+    /// Commit `files` into the repository at `repo`: repository CONTENT, which
+    /// anyone who lands a change in a served repository controls.
+    fn commit_files(repo: &std::path::Path, files: &[(&str, &str)]) {
+        for (rel, content) in files {
+            let file = repo.join(rel);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, content).unwrap();
+        }
+        for args in [&["add", "-A"][..], &["commit", "-q", "-m", "content"][..]] {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        }
+    }
+
+    /// A served repository's tracked files can spell a bare repository (`HEAD`,
+    /// `config`, `objects/`, `refs/`). Pointed there with `dir=`, git adopts it
+    /// and runs ITS configuration: here `core.fsmonitor`, a shell command, on
+    /// `git status`. The caller chose the directory, the content's author chose
+    /// the command. Every facade refuses a repository git finds as bare.
+    #[test]
+    fn an_embedded_bare_repository_runs_none_of_its_config() {
+        let base = Base::new("embedded-config");
+        let root = base.dir("root");
+        let served = base.repo("root/served");
+        let marker = base.0.join("fsmonitor-ran");
+        let config = format!(
+            "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tworktree = .\n\
+             \tfsmonitor = \"touch {}; false\"\n",
+            marker.display()
+        );
+        commit_files(
+            &served,
+            &[
+                ("evil/HEAD", "ref: refs/heads/main\n"),
+                ("evil/config", &config),
+                ("evil/objects/.keep", ""),
+                ("evil/refs/.keep", ""),
+            ],
+        );
+        let evil = served.join("evil");
+        for iri in GIT_IRIS {
+            let out = source_under(
+                &[&root],
+                iri,
+                &[("dir", evil.to_str().unwrap())],
+                &git_cap(),
+            );
+            assert!(
+                !marker.exists(),
+                "{iri} ran the embedded repository's core.fsmonitor: {out:?}"
+            );
+            assert!(matches!(out, Err(Error::Endpoint(_))), "{iri}: {out:?}");
+        }
+        // The served repository itself still answers.
+        let out = source_under(
+            &[&root],
+            "urn:repo:status",
+            &[("dir", served.to_str().unwrap())],
+            &git_cap(),
+        );
+        assert!(out.is_ok(), "{out:?}");
+    }
+
+    /// Two tracked files, `HEAD` and `commondir`, make a directory under a root
+    /// a git directory whose refs and objects are another repository's: one
+    /// outside every root. Confinement compares paths, so it passes; git then
+    /// reads the outside repository.
+    #[test]
+    fn an_embedded_git_directory_cannot_reach_a_repository_outside_the_roots() {
+        let base = Base::new("embedded-commondir");
+        let root = base.dir("root");
+        let outside = base.dir("outside");
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&outside)
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args(["init", "-q", "-b", "main"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&outside)
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args(["commit", "-q", "--allow-empty", "-m", "outside-secret"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let served = base.repo("root/served");
+        let commondir = format!("{}\n", outside.join(".git").display());
+        commit_files(
+            &served,
+            &[("peek/HEAD", "ref: refs/heads/main\n"), ("peek/commondir", &commondir)],
+        );
+        let peek = served.join("peek");
+        let dir = peek.to_str().unwrap();
+        let out = source_under(&[&root], "urn:repo:log", &[("dir", dir)], &git_cap());
+        let read = out
+            .as_ref()
+            .map(|answer| String::from_utf8_lossy(&answer.bytes).into_owned());
+        assert!(
+            !matches!(&read, Ok(log) if log.contains("outside-secret")),
+            "urn:repo:log read a repository outside the roots: {read:?}"
+        );
+        assert!(matches!(out, Err(Error::Endpoint(_))), "{read:?}");
+        let out = source_under(
+            &[&root],
+            "urn:repo:show",
+            &[("dir", dir), ("rev", "main"), ("path", "x")],
+            &git_cap(),
+        );
+        assert!(matches!(out, Err(Error::Endpoint(_))), "{out:?}");
+    }
+
+    /// `repo=` is `owner/name`, as described. gh also takes `HOST/OWNER/REPO`
+    /// and sends that host's credentials there, so a looser value would let a
+    /// caller choose where gh connects. Each value is refused before gh runs;
+    /// the hosts here are loopback, so even a regression reaches no network
+    /// beyond this machine.
+    #[test]
+    fn pr_repo_must_be_owner_and_name() {
+        let gh = Capability::scoped(["urn:cap:exec:gh"]);
+        for repo in [
+            "127.0.0.1:9/owner/name",
+            "localhost/owner/name",
+            "--web",
+            "-owner/name",
+            "owner",
+            "owner/",
+            "/name",
+            "owner/..",
+            "owner/name?x",
+            "own er/name",
+        ] {
+            for iri in [
+                "urn:repo:pr:view",
+                "urn:repo:pr:diff",
+                "urn:repo:pr:checks",
+                "urn:repo:pr:files",
+                "urn:repo:pr:list",
+            ] {
+                let err = source(iri, &[("pr", "1"), ("repo", repo)], &gh).unwrap_err();
+                match &err {
+                    Error::InvalidArgument { name, detail } => {
+                        assert_eq!(name, "repo", "{iri} {repo}: {err:?}");
+                        assert!(detail.contains("owner/name"), "{iri} {repo}: {detail}");
+                    }
+                    _ => panic!("{iri} {repo:?}: {err:?}"),
+                }
+            }
+        }
+    }
+
     /// No roots configured: every `dir=` is refused, and the refusal names how
     /// a host configures them. A call without `dir=` is the host's own cwd and
     /// still runs (see `a_facade_declares_its_capability_and_reads_this_repo`).
