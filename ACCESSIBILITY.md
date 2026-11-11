@@ -72,6 +72,9 @@ that shows these.
 
 ## How it is tested
 
+- `tests/audit.rs`: collected and streamed JSON logs preserve a unit separator in
+  author names and subjects, empty subjects, and long subjects with control characters.
+  Repository-root pathspecs keep their meaning when `dir=` names a subdirectory.
 - `src/lib.rs`: `pr_list_and_diff_are_gated` pins `limit must be a number` and the `state`
   refusal's list; `output_reader_accepts_exact_limit_and_refuses_next_byte` that the refusal
   states the limit; `run_is_capability_gated_and_allowlisted` the allowlist refusal;
