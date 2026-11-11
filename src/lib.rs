@@ -746,7 +746,14 @@ fn log(roots: Roots) -> impl ikigai_core::Endpoint {
         let (args, want_json) = log_args(inv)?;
         let raw = run(inv, "git", &args, inv.inline_str("dir").ok(), &roots)?;
         if want_json {
-            let entries: Vec<String> = raw.lines().filter_map(log_entry).collect();
+            let mut entries = Vec::new();
+            let mut remaining = raw.as_bytes();
+            while !remaining.is_empty() {
+                let end = log_record_end(remaining).ok_or_else(log_record_error)?;
+                let record = std::str::from_utf8(&remaining[..end]).expect("decoded output");
+                entries.push(log_entry(record).ok_or_else(log_record_error)?);
+                remaining = &remaining[end + 1..];
+            }
             Ok(json(format!("[{}]", entries.join(","))))
         } else {
             Ok(text(raw))
@@ -799,22 +806,53 @@ fn log_args(inv: &Invocation<'_>) -> Result<(Vec<String>, bool)> {
     let want_json = wants_json(inv);
     let mut args: Vec<String> = vec!["log".to_string()];
     if want_json {
-        args.push("--pretty=format:%H%x1f%an%x1f%aI%x1f%s".to_string());
+        // Four NUL-terminated fields: names can contain the old unit separator,
+        // and line boundaries are not field boundaries. tformat plus -z also
+        // terminates the last subject, including an empty one.
+        args.push("--pretty=tformat:%H%x00%an%x00%aI%x00%s".to_string());
+        args.push("-z".to_string());
     } else {
         args.push("--oneline".to_string());
     }
     args.push(format!("-{limit}"));
-    // The pathspec rides after `--`, so it reaches git as a path and only
-    // a path — the same argv either face builds, shape untouched.
+    // Both faces interpret path= from the repository root even when dir=
+    // names a subdirectory. It still travels after git's path delimiter.
     if let Some(path) = path {
         args.push("--".to_string());
-        args.push(path);
+        args.push(root_pathspec(&path));
     }
     Ok((args, want_json))
 }
 
+/// Anchor a pathspec at the repository root without losing its magic.
+fn root_pathspec(path: &str) -> String {
+    if path == ":" {
+        path.to_string() // Git's special "no pathspec" spelling.
+    } else if let Some(magic) = path.strip_prefix(":(") {
+        format!(":(top,{magic}")
+    } else if let Some(short) = path.strip_prefix(':') {
+        format!(":/{short}")
+    } else {
+        format!(":(top){path}")
+    }
+}
+
+/// Index of the fourth NUL, excluding it from the record passed to log_entry.
+fn log_record_end(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| **b == 0)
+        .nth(3)
+        .map(|(i, _)| i)
+}
+
+fn log_record_error() -> Error {
+    Error::Endpoint("git log: incomplete structured record; no complete answer returned".into())
+}
+
 fn log_entry(line: &str) -> Option<String> {
-    let mut parts = line.splitn(4, '\x1f');
+    let mut parts = line.splitn(4, '\0');
     match (parts.next(), parts.next(), parts.next(), parts.next()) {
         (Some(hash), Some(author), Some(date), Some(subject)) => Some(format!(
             "{{\"hash\":{},\"author\":{},\"date\":{},\"subject\":{}}}",

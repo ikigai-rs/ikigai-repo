@@ -308,16 +308,13 @@ fn log_json(raw: Body, limit: u64) -> Body {
         move |state| async move {
             let mut s = state?;
             loop {
-                let line = if let Some(at) = s.pending.iter().position(|b| *b == b'\n') {
+                let line = if let Some(at) = log_record_end(&s.pending) {
                     let rest = s.pending.split_off(at + 1);
                     let mut line = std::mem::replace(&mut s.pending, rest);
                     line.pop();
-                    if line.last() == Some(&b'\r') {
-                        line.pop();
-                    }
                     Some(line)
                 } else if s.ended && !s.pending.is_empty() {
-                    Some(std::mem::take(&mut s.pending))
+                    return Some((Err(log_record_error()), None));
                 } else {
                     None
                 };
@@ -532,8 +529,8 @@ mod tests {
 
     #[test]
     fn json_transform_matches_bytes_and_refuses_overflow_or_late_failure() {
-        let record = "hash\x1fauthor\x1fdate\x1fquote \" and slash \\";
-        let input = format!("{record}\n{record}");
+        let record = "hash\0author\0date\0quote \" and slash \\";
+        let input = format!("{record}\0{record}\0");
         let expected = format!(
             "[{},{}]",
             log_entry(record).unwrap(),
@@ -556,6 +553,13 @@ mod tests {
         assert!(matches!(
             block_on(log_json(raw(), expected.len() as u64 - 1).collect(1000)),
             Err(Error::OverBudget { .. })
+        ));
+        let incomplete = Body::once(futures::stream::iter([Ok(Bytes::from_static(
+            b"hash\0author\0date\0unterminated subject",
+        ))]));
+        assert!(matches!(
+            block_on(log_json(incomplete, 1000).collect(1000)),
+            Err(Error::Endpoint(_))
         ));
         let raw = Body::once(futures::stream::iter([
             Ok(Bytes::from(input)),

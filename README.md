@@ -11,7 +11,7 @@ argv. There is **no low-level exec endpoint** (see [Changes](#changes)):
 | resource | what it is |
 |----------|------------|
 | `urn:repo:status` | the working tree's status (`git status --porcelain=v1 -b`) |
-| `urn:repo:log` | recent history (`git log --oneline`, `limit=` commits, default 20); `path=` restricts to commits touching a file/subtree (`git log -- <path>`) — under squash-merge style, the merged-PR-per-path index; `as=application/json` → `[{hash, author, date, subject}]` (full sha, RFC 3339 date) |
+| `urn:repo:log` | recent history (`git log --oneline`, `limit=` commits, default 20); `path=` is a repository-root-relative pathspec that restricts to commits touching a file/subtree (`git log -- <path>`) — under squash-merge style, the merged-PR-per-path index; `as=application/json` → `[{hash, author, date, subject}]` (full sha, RFC 3339 date) |
 | `urn:repo:show` | one file's bytes at a commit (`git cat-file`): `rev=` (a commit hash, branch or tag) and `path=` (relative to the repository root, taken literally) are required; answers `application/octet-stream`, or typed `NotFound` when `rev=` names no commit or `path=` is not a file at that commit |
 | `urn:repo:{repo}:object:sha:{sha}` | a locally held Git object by full SHA (40 or 64 hexadecimal digits): its `sha`, `type` (`commit`, `tree`, `blob`, `tag`), and for a blob its first commit and path; text by default, `as=application/json` for the structured face; requires `urn:cap:exec:git` |
 | `urn:repo:branch` | the current branch |
@@ -21,6 +21,12 @@ argv. There is **no low-level exec endpoint** (see [Changes](#changes)):
 | `urn:repo:pr:files` | the paths a PR changes (`gh pr view N --json files`), one per line; `as=application/json` → `{files: [{path, additions, deletions, changeType}]}` — the open-PR half of "which PRs touch this subtree" (`urn:repo:log path=` is the merged half) |
 | `urn:repo:pr:diff` | a PR's unified diff (`gh pr diff N`) — the raw change an explainer/reviewer reads |
 | `urn:repo:pr:checks` | the CI check runs for a PR and their state (`gh pr checks N`) — a snapshot, not a wait |
+
+The log's JSON face frames Git's four fields with NUL bytes internally so control
+characters in author names or subjects cannot shift fields. Subjects follow Git's
+`%s` semantics; multi-line bodies are not included. Both log faces interpret `path=`
+from the repository root even when `dir=` names a subdirectory, preserving pathspec
+magic such as `:(glob)` and exclusions.
 
 The `pr:*` facades take `pr=` (the number) plus optional `repo=` (`owner/name`)
 or `dir=` (a repo directory to run in); they require `urn:cap:exec:gh`.
