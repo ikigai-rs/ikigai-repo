@@ -1,7 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.5.1
 
+- `urn:repo:log` frames each record with NUL-terminated fields, so an author name containing the
+  old separator no longer shifts the date and subject; `path=` is anchored at the repository root
+  (a call from a subdirectory returned an empty log) while keeping pathspec magic (ledger #3447).
 - Refuse bare repositories git would adopt from `dir=` (`safe.bareRepository=explicit` for git
   and for the git gh runs). Tracked files inside a served repository could spell one, with its
   own `core.fsmonitor` command (run by `urn:repo:status`) or a `commondir` naming a repository
