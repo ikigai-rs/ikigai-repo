@@ -50,6 +50,16 @@
 //! A call WITHOUT `dir=` runs in the process's working directory, which the
 //! host chose when it started; a caller cannot move it.
 //!
+//! The repository is the one git finds from that directory. Every git and gh
+//! run sets `safe.bareRepository=explicit`, so tracked files that spell a bare
+//! repository inside a served one (its own `config`, or a `commondir` naming a
+//! repository outside every root) are refused rather than adopted, and
+//! inherited variables that name another repository (`GIT_DIR`,
+//! `GIT_WORK_TREE`, `GIT_OBJECT_DIRECTORY` and the like) are removed. git runs
+//! without the host's GitHub tokens (`GH_TOKEN` and the like); gh keeps them,
+//! and its `repo=` must be `owner/name`, so a caller never names the host gh
+//! connects to.
+//!
 //! ## The verb tells the truth
 //! A read (`git status`, `gh pr view`) is a `Source`; a mutation (`git commit`)
 //! would be a `Sink` under a write capability. v1 ships the read facades only.
@@ -280,6 +290,47 @@ fn tool_failed(tool: &str, output: &Output) -> Error {
     ))
 }
 
+/// Variables that make git use a repository, index or object store other than
+/// the one it finds from its working directory. Removed from every child, gh's
+/// included (gh runs git), so `dir=` and its ceiling decide the repository.
+const REPOSITORY_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+];
+
+/// GitHub credentials. gh needs them; the git facades read local repositories
+/// only, so git and anything a repository's configuration runs never see them.
+const TOKEN_ENV: &[&str] = &[
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+];
+
+/// Set `safe.bareRepository=explicit` for git and for the git gh runs, after
+/// any command-scope configuration the host already passes. Tracked files can
+/// spell a bare repository (`HEAD`, `config`, `objects/`, `refs/`, or
+/// `commondir` naming another repository), and git would adopt it from a
+/// `dir=` under a root: running its configuration (`core.fsmonitor`) or
+/// reading a repository outside every root. This setting is honored only from
+/// protected configuration, which the command scope is. Git 2.43 also refuses
+/// a non-bare repository's own `.git` directory under it; no facade needs one.
+fn refuse_implicit_bare(command: &mut Command) {
+    let count = std::env::var("GIT_CONFIG_COUNT")
+        .ok()
+        .and_then(|count| count.parse::<usize>().ok())
+        .unwrap_or(0);
+    command
+        .env(format!("GIT_CONFIG_KEY_{count}"), "safe.bareRepository")
+        .env(format!("GIT_CONFIG_VALUE_{count}"), "explicit")
+        .env("GIT_CONFIG_COUNT", (count + 1).to_string());
+}
+
 fn prepare_command(
     inv: &Invocation<'_>,
     tool: &str,
@@ -305,6 +356,17 @@ fn prepare_command(
     // ambient: process: running git and gh is this connector's job; the tool is one of ALLOWED_TOOLS, the caller holds `urn:cap:exec:{tool}` (checked above), and its directory is confined to the host's roots
     #[allow(clippy::disallowed_methods)]
     let mut command = Command::new(tool);
+    // The repository is the one git finds from the directory, never one an
+    // inherited variable names instead.
+    for name in REPOSITORY_ENV {
+        command.env_remove(name);
+    }
+    if tool == "git" {
+        for name in TOKEN_ENV {
+            command.env_remove(name);
+        }
+    }
+    refuse_implicit_bare(&mut command);
     // Tool-generated presentation must stay plain even when the host forces color.
     if tool == "git" {
         command.args(["-c", "color.ui=never"]);
@@ -368,6 +430,37 @@ fn parse_pr(inv: &Invocation<'_>) -> Result<u64> {
         .map_err(|_| Error::MissingArgument("pr (the pull-request number)".to_string()))?;
     s.parse()
         .map_err(|_| Error::Endpoint(format!("pr must be a number, got `{s}`")))
+}
+
+/// Parse the optional `repo=` argument: `owner/name`, as described. gh also
+/// takes `HOST/OWNER/REPO` and then connects to that host with its credentials
+/// for it, so anything looser would let a caller choose where gh connects. Each
+/// part is a GitHub-style name: letters, digits, `-`, `_` and `.`, not starting
+/// with `-` and not `.` or `..`.
+fn parse_repo<'a>(inv: &'a Invocation<'_>) -> Result<Option<&'a str>> {
+    match inv.inline_str("repo") {
+        Ok(repo) if pr_repo_is_owner_and_name(repo) => Ok(Some(repo)),
+        Ok(repo) => Err(invalid(
+            "repo",
+            format!(
+                "{} is not owner/name: give an owner and a repository name",
+                quoted(repo)
+            ),
+        )),
+        Err(_) => Ok(None),
+    }
+}
+
+fn pr_repo_is_owner_and_name(repo: &str) -> bool {
+    let name = |part: &str| {
+        !part.is_empty()
+            && !part.starts_with('-')
+            && !matches!(part, "." | "..")
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    matches!(repo.split_once('/'), Some((owner, rest)) if name(owner) && name(rest))
 }
 
 /// Parse an optional `path=` argument as a pathspec. The value travels in the
@@ -523,7 +616,7 @@ fn gh_pr_args(
         args.push("--json".to_string());
         args.push(fields.to_string());
     }
-    if let Ok(repo) = inv.inline_str("repo") {
+    if let Some(repo) = parse_repo(inv)? {
         args.push("--repo".to_string());
         args.push(repo.to_string());
     }
@@ -617,7 +710,7 @@ fn pr_files(roots: Roots) -> FnEndpoint {
     FnEndpoint::new("repo-pr-files", move |inv: &Invocation<'_>| {
         let pr = parse_pr(inv)?;
         let want_json = wants_json(inv);
-        let repo = inv.inline_str("repo").ok();
+        let repo = parse_repo(inv)?;
         let args = pr_files_args(pr, want_json, repo);
         let dir = inv.inline_str("dir").ok();
         run(inv, "gh", &args, dir, &roots).map(if want_json { json } else { text })
@@ -677,7 +770,7 @@ fn pr_list(roots: Roots) -> FnEndpoint {
         }
         let limit = parse_limit(inv, 30)?;
         let want_json = wants_json(inv);
-        let repo = inv.inline_str("repo").ok();
+        let repo = parse_repo(inv)?;
         let args = pr_list_args(state, limit, want_json, repo);
         let dir = inv.inline_str("dir").ok();
         run(inv, "gh", &args, dir, &roots).map(if want_json { json } else { text })
@@ -2556,7 +2649,10 @@ mod tests {
         let commondir = format!("{}\n", outside.join(".git").display());
         commit_files(
             &served,
-            &[("peek/HEAD", "ref: refs/heads/main\n"), ("peek/commondir", &commondir)],
+            &[
+                ("peek/HEAD", "ref: refs/heads/main\n"),
+                ("peek/commondir", &commondir),
+            ],
         );
         let peek = served.join("peek");
         let dir = peek.to_str().unwrap();
@@ -2614,6 +2710,9 @@ mod tests {
                     _ => panic!("{iri} {repo:?}: {err:?}"),
                 }
             }
+        }
+        for repo in ["ikigai-rs/ikigai-repo", "a/b.c_d-e", "Owner9/.github"] {
+            assert!(pr_repo_is_owner_and_name(repo), "{repo}");
         }
     }
 

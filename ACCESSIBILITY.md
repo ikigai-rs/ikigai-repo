@@ -34,7 +34,8 @@ All of it is in `src/lib.rs` unless named otherwise.
   face uses `sha`, `type` and `firstAppearance` (a commit and path, or `null`).
 - **Refusals and errors**: a capability that does not grant `urn:cap:exec:git` or
   `urn:cap:exec:gh`, a `dir=` or explicit list `root=` outside the configured roots, a `limit`, `pr` or `state` that is
-  not a valid value (`state must be one of open, closed, merged, all, got …`), a `path` that is
+  not a valid value, a `repo` that is not `owner/name` (``repo `…` is not owner/name: give an
+  owner and a repository name``) (`state must be one of open, closed, merged, all, got …`), a `path` that is
   a flag, a `rev` or `path` that `urn:repo:show` cannot take or that does not exist (``rev `…`
   does not name a commit in this repository``, ``path `…` is not a file at commit …``), output
   past the 8 MiB limit, and a tool that failed: `` exec: `git` exited N: `` and
@@ -75,7 +76,8 @@ that shows these.
 - `tests/audit.rs`: collected and streamed JSON logs preserve a unit separator in
   author names and subjects, empty subjects, and long subjects with control characters.
   Repository-root pathspecs keep their meaning when `dir=` names a subdirectory.
-- `src/lib.rs`: `pr_list_and_diff_are_gated` pins `limit must be a number` and the `state`
+- `src/lib.rs`: `pr_repo_must_be_owner_and_name` pins that the `repo` refusal names
+  `owner/name`; `pr_list_and_diff_are_gated` pins `limit must be a number` and the `state`
   refusal's list; `output_reader_accepts_exact_limit_and_refuses_next_byte` that the refusal
   states the limit; `run_is_capability_gated_and_allowlisted` the allowlist refusal;
   `no_roots_refuses_every_dir` that the `dir=` refusal names what to configure;

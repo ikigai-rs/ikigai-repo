@@ -62,7 +62,10 @@ fn the_host_environment_neither_redirects_nor_leaks() {
         &[
             "config",
             "core.fsmonitor",
-            &format!("echo \"${{GH_TOKEN:-unset}}\" > {}; false", marker.display()),
+            &format!(
+                "echo \"${{GH_TOKEN:-unset}}\" > {}; false",
+                marker.display()
+            ),
         ],
     );
     let gh_config = base.join("gh-config");
