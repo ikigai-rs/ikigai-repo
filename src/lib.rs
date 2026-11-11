@@ -50,6 +50,16 @@
 //! A call WITHOUT `dir=` runs in the process's working directory, which the
 //! host chose when it started; a caller cannot move it.
 //!
+//! The repository is the one git finds from that directory. Every git and gh
+//! run sets `safe.bareRepository=explicit`, so tracked files that spell a bare
+//! repository inside a served one (its own `config`, or a `commondir` naming a
+//! repository outside every root) are refused rather than adopted, and
+//! inherited variables that name another repository (`GIT_DIR`,
+//! `GIT_WORK_TREE`, `GIT_OBJECT_DIRECTORY` and the like) are removed. git runs
+//! without the host's GitHub tokens (`GH_TOKEN` and the like); gh keeps them,
+//! and its `repo=` must be `owner/name`, so a caller never names the host gh
+//! connects to.
+//!
 //! ## The verb tells the truth
 //! A read (`git status`, `gh pr view`) is a `Source`; a mutation (`git commit`)
 //! would be a `Sink` under a write capability. v1 ships the read facades only.
@@ -280,6 +290,47 @@ fn tool_failed(tool: &str, output: &Output) -> Error {
     ))
 }
 
+/// Variables that make git use a repository, index or object store other than
+/// the one it finds from its working directory. Removed from every child, gh's
+/// included (gh runs git), so `dir=` and its ceiling decide the repository.
+const REPOSITORY_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+];
+
+/// GitHub credentials. gh needs them; the git facades read local repositories
+/// only, so git and anything a repository's configuration runs never see them.
+const TOKEN_ENV: &[&str] = &[
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+];
+
+/// Set `safe.bareRepository=explicit` for git and for the git gh runs, after
+/// any command-scope configuration the host already passes. Tracked files can
+/// spell a bare repository (`HEAD`, `config`, `objects/`, `refs/`, or
+/// `commondir` naming another repository), and git would adopt it from a
+/// `dir=` under a root: running its configuration (`core.fsmonitor`) or
+/// reading a repository outside every root. This setting is honored only from
+/// protected configuration, which the command scope is. Git 2.43 also refuses
+/// a non-bare repository's own `.git` directory under it; no facade needs one.
+fn refuse_implicit_bare(command: &mut Command) {
+    let count = std::env::var("GIT_CONFIG_COUNT")
+        .ok()
+        .and_then(|count| count.parse::<usize>().ok())
+        .unwrap_or(0);
+    command
+        .env(format!("GIT_CONFIG_KEY_{count}"), "safe.bareRepository")
+        .env(format!("GIT_CONFIG_VALUE_{count}"), "explicit")
+        .env("GIT_CONFIG_COUNT", (count + 1).to_string());
+}
+
 fn prepare_command(
     inv: &Invocation<'_>,
     tool: &str,
@@ -305,6 +356,17 @@ fn prepare_command(
     // ambient: process: running git and gh is this connector's job; the tool is one of ALLOWED_TOOLS, the caller holds `urn:cap:exec:{tool}` (checked above), and its directory is confined to the host's roots
     #[allow(clippy::disallowed_methods)]
     let mut command = Command::new(tool);
+    // The repository is the one git finds from the directory, never one an
+    // inherited variable names instead.
+    for name in REPOSITORY_ENV {
+        command.env_remove(name);
+    }
+    if tool == "git" {
+        for name in TOKEN_ENV {
+            command.env_remove(name);
+        }
+    }
+    refuse_implicit_bare(&mut command);
     // Tool-generated presentation must stay plain even when the host forces color.
     if tool == "git" {
         command.args(["-c", "color.ui=never"]);
@@ -368,6 +430,37 @@ fn parse_pr(inv: &Invocation<'_>) -> Result<u64> {
         .map_err(|_| Error::MissingArgument("pr (the pull-request number)".to_string()))?;
     s.parse()
         .map_err(|_| Error::Endpoint(format!("pr must be a number, got `{s}`")))
+}
+
+/// Parse the optional `repo=` argument: `owner/name`, as described. gh also
+/// takes `HOST/OWNER/REPO` and then connects to that host with its credentials
+/// for it, so anything looser would let a caller choose where gh connects. Each
+/// part is a GitHub-style name: letters, digits, `-`, `_` and `.`, not starting
+/// with `-` and not `.` or `..`.
+fn parse_repo<'a>(inv: &'a Invocation<'_>) -> Result<Option<&'a str>> {
+    match inv.inline_str("repo") {
+        Ok(repo) if pr_repo_is_owner_and_name(repo) => Ok(Some(repo)),
+        Ok(repo) => Err(invalid(
+            "repo",
+            format!(
+                "{} is not owner/name: give an owner and a repository name",
+                quoted(repo)
+            ),
+        )),
+        Err(_) => Ok(None),
+    }
+}
+
+fn pr_repo_is_owner_and_name(repo: &str) -> bool {
+    let name = |part: &str| {
+        !part.is_empty()
+            && !part.starts_with('-')
+            && !matches!(part, "." | "..")
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    matches!(repo.split_once('/'), Some((owner, rest)) if name(owner) && name(rest))
 }
 
 /// Parse an optional `path=` argument as a pathspec. The value travels in the
@@ -523,7 +616,7 @@ fn gh_pr_args(
         args.push("--json".to_string());
         args.push(fields.to_string());
     }
-    if let Ok(repo) = inv.inline_str("repo") {
+    if let Some(repo) = parse_repo(inv)? {
         args.push("--repo".to_string());
         args.push(repo.to_string());
     }
@@ -617,7 +710,7 @@ fn pr_files(roots: Roots) -> FnEndpoint {
     FnEndpoint::new("repo-pr-files", move |inv: &Invocation<'_>| {
         let pr = parse_pr(inv)?;
         let want_json = wants_json(inv);
-        let repo = inv.inline_str("repo").ok();
+        let repo = parse_repo(inv)?;
         let args = pr_files_args(pr, want_json, repo);
         let dir = inv.inline_str("dir").ok();
         run(inv, "gh", &args, dir, &roots).map(if want_json { json } else { text })
@@ -677,7 +770,7 @@ fn pr_list(roots: Roots) -> FnEndpoint {
         }
         let limit = parse_limit(inv, 30)?;
         let want_json = wants_json(inv);
-        let repo = inv.inline_str("repo").ok();
+        let repo = parse_repo(inv)?;
         let args = pr_list_args(state, limit, want_json, repo);
         let dir = inv.inline_str("dir").ok();
         run(inv, "gh", &args, dir, &roots).map(if want_json { json } else { text })
@@ -2456,6 +2549,171 @@ mod tests {
             &git_cap(),
         );
         assert!(out.is_ok(), "{out:?}");
+    }
+
+    /// Commit `files` into the repository at `repo`: repository CONTENT, which
+    /// anyone who lands a change in a served repository controls.
+    fn commit_files(repo: &std::path::Path, files: &[(&str, &str)]) {
+        for (rel, content) in files {
+            let file = repo.join(rel);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, content).unwrap();
+        }
+        for args in [&["add", "-A"][..], &["commit", "-q", "-m", "content"][..]] {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        }
+    }
+
+    /// A served repository's tracked files can spell a bare repository (`HEAD`,
+    /// `config`, `objects/`, `refs/`). Pointed there with `dir=`, git adopts it
+    /// and runs ITS configuration: here `core.fsmonitor`, a shell command, on
+    /// `git status`. The caller chose the directory, the content's author chose
+    /// the command. Every facade refuses a repository git finds as bare.
+    #[test]
+    fn an_embedded_bare_repository_runs_none_of_its_config() {
+        let base = Base::new("embedded-config");
+        let root = base.dir("root");
+        let served = base.repo("root/served");
+        let marker = base.0.join("fsmonitor-ran");
+        let config = format!(
+            "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tworktree = .\n\
+             \tfsmonitor = \"touch {}; false\"\n",
+            marker.display()
+        );
+        commit_files(
+            &served,
+            &[
+                ("evil/HEAD", "ref: refs/heads/main\n"),
+                ("evil/config", &config),
+                ("evil/objects/.keep", ""),
+                ("evil/refs/.keep", ""),
+            ],
+        );
+        let evil = served.join("evil");
+        for iri in GIT_IRIS {
+            let out = source_under(
+                &[&root],
+                iri,
+                &[("dir", evil.to_str().unwrap())],
+                &git_cap(),
+            );
+            assert!(
+                !marker.exists(),
+                "{iri} ran the embedded repository's core.fsmonitor: {out:?}"
+            );
+            assert!(matches!(out, Err(Error::Endpoint(_))), "{iri}: {out:?}");
+        }
+        // The served repository itself still answers.
+        let out = source_under(
+            &[&root],
+            "urn:repo:status",
+            &[("dir", served.to_str().unwrap())],
+            &git_cap(),
+        );
+        assert!(out.is_ok(), "{out:?}");
+    }
+
+    /// Two tracked files, `HEAD` and `commondir`, make a directory under a root
+    /// a git directory whose refs and objects are another repository's: one
+    /// outside every root. Confinement compares paths, so it passes; git then
+    /// reads the outside repository.
+    #[test]
+    fn an_embedded_git_directory_cannot_reach_a_repository_outside_the_roots() {
+        let base = Base::new("embedded-commondir");
+        let root = base.dir("root");
+        let outside = base.dir("outside");
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&outside)
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args(["init", "-q", "-b", "main"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&outside)
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args(["commit", "-q", "--allow-empty", "-m", "outside-secret"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let served = base.repo("root/served");
+        let commondir = format!("{}\n", outside.join(".git").display());
+        commit_files(
+            &served,
+            &[
+                ("peek/HEAD", "ref: refs/heads/main\n"),
+                ("peek/commondir", &commondir),
+            ],
+        );
+        let peek = served.join("peek");
+        let dir = peek.to_str().unwrap();
+        let out = source_under(&[&root], "urn:repo:log", &[("dir", dir)], &git_cap());
+        let read = out
+            .as_ref()
+            .map(|answer| String::from_utf8_lossy(&answer.bytes).into_owned());
+        assert!(
+            !matches!(&read, Ok(log) if log.contains("outside-secret")),
+            "urn:repo:log read a repository outside the roots: {read:?}"
+        );
+        assert!(matches!(out, Err(Error::Endpoint(_))), "{read:?}");
+        let out = source_under(
+            &[&root],
+            "urn:repo:show",
+            &[("dir", dir), ("rev", "main"), ("path", "x")],
+            &git_cap(),
+        );
+        assert!(matches!(out, Err(Error::Endpoint(_))), "{out:?}");
+    }
+
+    /// `repo=` is `owner/name`, as described. gh also takes `HOST/OWNER/REPO`
+    /// and sends that host's credentials there, so a looser value would let a
+    /// caller choose where gh connects. Each value is refused before gh runs;
+    /// the hosts here are loopback, so even a regression reaches no network
+    /// beyond this machine.
+    #[test]
+    fn pr_repo_must_be_owner_and_name() {
+        let gh = Capability::scoped(["urn:cap:exec:gh"]);
+        for repo in [
+            "127.0.0.1:9/owner/name",
+            "localhost/owner/name",
+            "--web",
+            "-owner/name",
+            "owner",
+            "owner/",
+            "/name",
+            "owner/..",
+            "owner/name?x",
+            "own er/name",
+        ] {
+            for iri in [
+                "urn:repo:pr:view",
+                "urn:repo:pr:diff",
+                "urn:repo:pr:checks",
+                "urn:repo:pr:files",
+                "urn:repo:pr:list",
+            ] {
+                let err = source(iri, &[("pr", "1"), ("repo", repo)], &gh).unwrap_err();
+                match &err {
+                    Error::InvalidArgument { name, detail } => {
+                        assert_eq!(name, "repo", "{iri} {repo}: {err:?}");
+                        assert!(detail.contains("owner/name"), "{iri} {repo}: {detail}");
+                    }
+                    _ => panic!("{iri} {repo:?}: {err:?}"),
+                }
+            }
+        }
+        for repo in ["ikigai-rs/ikigai-repo", "a/b.c_d-e", "Owner9/.github"] {
+            assert!(pr_repo_is_owner_and_name(repo), "{repo}");
+        }
     }
 
     /// No roots configured: every `dir=` is refused, and the refusal names how

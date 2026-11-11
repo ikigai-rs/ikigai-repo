@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Refuse bare repositories git would adopt from `dir=` (`safe.bareRepository=explicit` for git
+  and for the git gh runs). Tracked files inside a served repository could spell one, with its
+  own `core.fsmonitor` command (run by `urn:repo:status`) or a `commondir` naming a repository
+  outside every root (read by `urn:repo:log` and `urn:repo:show`) (ledger #3487).
+- Remove `GIT_DIR` and the other repository-selecting variables from every child's
+  environment, so an inherited one cannot replace `dir=`; git no longer receives the host's
+  GitHub tokens.
+- The `pr:*` facades refuse a `repo=` that is not `owner/name` with typed `InvalidArgument`.
+  gh read `HOST/OWNER/REPO` and connected to that host.
+
 ## 0.5.0
 
 - Add `urn:repo:{repo}:object:sha:{sha}`: whether a repository holds a git object by its full

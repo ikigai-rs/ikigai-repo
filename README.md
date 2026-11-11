@@ -77,6 +77,19 @@ configuration, as git and gh always do; `dir=` must resolve under a root supplie
 by the host with `space_with_roots`. The default `space()` refuses explicit
 directories because it has no configured roots.
 
+Repository content cannot choose the repository. Every git and gh run sets
+`safe.bareRepository=explicit` (through `GIT_CONFIG_COUNT`, after any the host
+passes), so a bare repository spelled by tracked files inside a served one is
+refused: such a directory could carry its own `core.fsmonitor` command, or a
+`commondir` naming a repository outside every root. With git 2.43 this also
+refuses a `dir=` inside a repository's `.git` directory. The children never
+inherit `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_INDEX_FILE`,
+`GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES` or `GIT_NAMESPACE`,
+and git never receives `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN` or
+`GITHUB_ENTERPRISE_TOKEN`. The `pr:*` `repo=` must be `owner/name` (letters,
+digits, `-`, `_`, `.`), never gh's `HOST/OWNER/REPO`, so a caller cannot choose
+the host gh sends credentials to.
+
 **The verb tells the truth**: a read (`git status`) is a `Source`; a mutation
 (`git commit`) is a `Sink` under a write capability. v1 ships the read facades.
 
