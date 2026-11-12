@@ -12,7 +12,7 @@ git's and gh's own; this file says which. It is not a conformance claim. Adapted
 | Status | Evaluation in progress. No conformance claim. |
 | Owner | the maintainers of this repository |
 | Report a barrier | [a GitHub issue](https://github.com/ikigai-rs/ikigai-repo/issues/new?labels=accessibility) with the `accessibility` label; anything security-sensitive through [private vulnerability reporting](https://github.com/ikigai-rs/ikigai-repo/security/advisories/new) |
-| Last reviewed | 2026-11-06 |
+| Last reviewed | 2026-11-12 |
 
 ## What it emits that people read
 
@@ -73,37 +73,39 @@ that shows these.
 
 ## How it is tested
 
-- `tests/audit.rs`: collected and streamed JSON logs preserve a unit separator in
-  author names and subjects, empty subjects, and long subjects with control characters.
-  Repository-root pathspecs keep their meaning when `dir=` names a subdirectory.
-- `src/lib.rs`: `pr_repo_must_be_owner_and_name` pins that the `repo` refusal names
-  `owner/name`; `pr_list_and_diff_are_gated` pins `limit must be a number` and the `state`
-  refusal's list; `output_reader_accepts_exact_limit_and_refuses_next_byte` that the refusal
-  states the limit; `run_is_capability_gated_and_allowlisted` the allowlist refusal;
-  `no_roots_refuses_every_dir` that the `dir=` refusal names what to configure;
-  `list_confines_explicit_roots_after_resolving_paths` that list refusals name `root=`;
-  `git_does_not_search_above_the_root` that git's own `not a git repository` reaches the
-  caller; `pr_list_builds_the_gh_invocation` the text face's template;
-  `show_refuses_a_path_or_rev_that_does_not_exist` that those refusals name the argument and
-  quote the value, and `show_refuses_flags_and_paths_out_of_the_tree` that the others name it.
-- `src/lib.rs`: `object_types_and_faces_in_a_scratch_repository` pins labeled text,
-  escaped control characters in a path, and the JSON fields for all four types;
-  `object_refuses_malformed_sha_and_wrong_repository` checks typed refusals and
-  the SHA form. `object_is_gated_in_the_kernel_and_endpoint` checks the capability
-  refusal in both layers. `object_absence_expires_and_presence_is_cached` checks
-  that a miss is not retained and a successful answer has no time expiry.
-- `src/process_body.rs`: `late_nonzero_exit_is_an_error_item_with_stderr` pins the exit status
-  and the tool's stderr in a streamed failure.
+Every named check has a result: Pass, Fail or Blocked, with evidence. A Pass covers only
+that check, not overall accessibility or WCAG conformance. Blocked means the check could not
+be completed; it is not a Pass. No historical run is counted as current verification.
 
-- `src/lib.rs`: `git_facades_request_plain_output_despite_repository_color` checks status,
-  branch and log answers for ESC bytes with `color.ui=always` in a scratch repository.
-  `tests/streams.rs` checks both log paths and faces with that configuration, and a local
-  gh fixture checks the plain-output environment on collected and streamed diff calls
-  while the parent environment forces color and terminal output. The fixture does not
-  contact GitHub or test gh's own rendering.
+The automated checks below ran on 2026-11-12 against unchanged main commit
+[`ee622ee`](https://github.com/ikigai-rs/ikigai-repo/commit/ee622eea010b94e316d7ab10d5ed017a8b5a8948),
+on macOS 27.2, with rustc 1.99.1, Cargo 1.99.1 and Git 2.54.0 (Apple Git-157).
+The command was `cargo test --workspace -- --skip non_utf8_object_path_is_refused_and_status_uses_git_quoting`:
+58 unit tests, 7 audit tests, 4 module-contract tests, 1 host-environment test, 3 stream tests
+and 1 doctest passed. The excluded check is recorded separately below. CI's
+[workflow](.github/workflows/ci.yml) calls the shared Rust workflow, which runs
+`cargo test --workspace` without this exclusion. These tests inspect bytes, arguments,
+metadata and typed errors; they do not evaluate how a host presents them to a person.
 
-**No automated accessibility checker, browser or assistive technology has been used on this
-output.**
+| Check | Result | Evidence |
+|---|---|---|
+| JSON log content and repository-root pathspecs | Pass | `tests/audit.rs`, run by the command above: collected and streamed JSON preserve a unit separator in author names and subjects, empty subjects, and long multiline subjects with control characters. Pathspecs retain their meaning from a subdirectory. This checks data preservation, not spoken or visual presentation. |
+| Argument, capability and directory refusals | Pass | `src/lib.rs`: `pr_repo_must_be_owner_and_name`, `pr_list_and_diff_are_gated`, `run_is_capability_gated_and_allowlisted`, `no_roots_refuses_every_dir`, `list_confines_explicit_roots_after_resolving_paths`, `git_does_not_search_above_the_root`, `show_refuses_a_path_or_rev_that_does_not_exist` and `show_refuses_flags_and_paths_out_of_the_tree`, run by the command above. Pin argument names, quoted values, closed vocabularies and selected tool errors; do not establish clarity of every refusal. |
+| Text-face templates and facade descriptions | Pass | `src/lib.rs`: `pr_list_builds_the_gh_invocation`, `pr_files_builds_the_gh_invocation` and `descriptions_declare_faces_args_and_caps`, run by the command above. Pin templates and declared faces, arguments and capabilities; do not test a host's help or catalog rendering. |
+| Object labels, escaped paths, typed refusals and cache behavior | Pass | `src/lib.rs`: `object_types_and_faces_in_a_scratch_repository`, `object_refuses_malformed_sha_and_wrong_repository`, `object_is_gated_in_the_kernel_and_endpoint` and `object_absence_expires_and_presence_is_cached`, run by the command above. Pin labeled text, JSON-quoted control characters, JSON fields for four object types, SHA form, capability refusals and cache expiry; do not test assistive technology. |
+| Output-limit refusals and streamed tool failure | Pass | `src/lib.rs`: `output_reader_accepts_exact_limit_and_refuses_next_byte`; `src/process_body.rs`: `exact_budget_succeeds_next_byte_is_error_item` and `late_nonzero_exit_is_an_error_item_with_stderr`, run by the command above. Pin the collected limit message, streamed budget error, exit status and stderr; do not establish that every error gives enough recovery guidance. |
+| Plain git output under forced repository color | Pass | `src/lib.rs`: `git_facades_request_plain_output_despite_repository_color`; `tests/streams.rs`: `log_body_is_incremental_and_matches_bytes_in_both_faces`, run by the command above. Check status, branch and log for ESC bytes with `color.ui=always`, and agreement between collected and streamed log faces. Do not strip or evaluate arbitrary repository content. |
+| Plain-output environment for collected and streamed gh diff | Pass | `tests/streams.rs`: `pr_diff_body_matches_bytes_without_reaching_github`, run by the command above. A local shell fixture checks `NO_COLOR=1`, `CLICOLOR=0`, `CLICOLOR_FORCE=0` and absence of `GH_FORCE_TTY` while the parent forces color and terminal output. It does not execute real gh, contact GitHub or evaluate gh's rendering. |
+| Module contracts, host environment and API example | Pass | `tests/conformance.rs`, `tests/host_env.rs` and the `space_with_roots` doctest, run by the command above. Check module metadata, typed grants and required arguments, local media types, host-environment isolation and example compilation. The module-contract suite opts out of live GitHub calls; none of these checks establish WCAG conformance. |
+| Non-UTF-8 object-path refusal and git status quoting | Blocked | `cargo test --all-targets` on the same main commit and tools failed in `tests/audit.rs`: `non_utf8_object_path_is_refused_and_status_uses_git_quoting` could not create its filename fixture on macOS (`Illegal byte sequence`, OS error 92). It did not reach the crate's refusal or quoting assertions. Other unusual-path audit fixtures passed; they do not cover this case. |
+| Automated accessibility checker | Blocked | No axe or other accessibility checker was run on a host presenting this output; no host page or checker session was configured for this evaluation. Rust tests are not an accessibility checker. |
+| Browser presentation, zoom, reflow and contrast | Blocked | No browser evaluation was run on a host presenting this output. The crate emits no HTML or SVG; host presentation still needs evaluation. |
+| Manual keyboard | Blocked | No person performed a keyboard pass in a terminal or host presenting this output; no manual session was available for this evaluation. |
+| Screen reader | Blocked | No screen reader was used on this output; no screen reader session was available for this evaluation. |
+| Screen magnifier | Blocked | No screen magnifier was used on this output; no magnifier session was available for this evaluation. |
+| Speech input | Blocked | No speech-input software was used on this output; no speech-input session was available for this evaluation. |
+| Switch access | Blocked | No switch-access software was used on this output; no switch-access session was available for this evaluation. |
+| Braille display | Blocked | No braille display was used on this output; no braille display was available for this evaluation. |
 
 ## Known limitations
 
@@ -121,8 +123,11 @@ Found by reading the source on 2026-10-31, not by testing:
 
 Read this file before changing any output listed above: a text face, a refusal's words or a
 facade's description. Keep meaning in words, name the argument a refusal is about, and keep
-git's and gh's words unchanged. Say in the pull request what was tested, with what, and what was
-not.
+git's and gh's words unchanged. In the pull request's Accessibility section, give each check
+a row in a `Check | Result | Evidence` table: Pass, Fail or Blocked, with the test or command,
+tool and version used, or why it could not run. Keep unrun checks as Blocked, including every
+assistive technology nobody used. A historical run CI does not repeat stays Blocked with its
+date. State what each Pass covers and does not cover.
 
 ## Reporting a barrier
 
@@ -142,3 +147,4 @@ through
 | 2026-11-03 | Add `urn:repo:show`: its passed-through bytes and its refusals. |
 | 2026-11-06 | Add object lookup: labeled text, JSON-quoted paths, SHA and repository refusals, and scratch-repository tests. |
 | 2026-11-06 | Request plain git and gh output; test forced-color configuration and environment. |
+| 2026-11-12 | Record check results, current main evidence and blocked host and assistive-technology evaluations. |
