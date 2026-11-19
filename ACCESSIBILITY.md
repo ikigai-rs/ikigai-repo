@@ -32,8 +32,8 @@ All of it is in `src/lib.rs` unless named otherwise.
   newlines and other control characters stay visible. A blob with no known
   introduction says `First appearance: not found in reachable history`. Its JSON
   face uses `sha`, `type` and `firstAppearance` (a commit and path, or `null`).
-- **Refusals and errors**: a capability that does not grant `urn:cap:exec:git` or
-  `urn:cap:exec:gh`, a `dir=` or explicit list `root=` outside the configured roots, a `limit`, `pr` or `state` that is
+- **Refusals and errors**: a capability that does not grant `urn:cap:exec:read:git` or
+  `urn:cap:exec:read:gh`, a `dir=` or explicit list `root=` outside the configured roots, a `limit`, `pr` or `state` that is
   not a valid value, a `repo` that is not `owner/name` (``repo `…` is not owner/name: give an
   owner and a repository name``) (`state must be one of open, closed, merged, all, got …`), a `path` that is
   a flag, a `rev` or `path` that `urn:repo:show` cannot take or that does not exist (``rev `…`

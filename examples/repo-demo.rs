@@ -7,7 +7,7 @@ use std::sync::Arc;
 fn main() {
     let kernel = Kernel::new(Arc::new(ikigai_repo::space()));
     // A capability scoped to exactly "may run git" — nothing else.
-    let cap = Capability::scoped(["urn:cap:exec:git"]);
+    let cap = Capability::scoped(["urn:cap:exec:read:git"]);
 
     for iri in ["urn:repo:branch", "urn:repo:status", "urn:repo:log"] {
         let req = Request::new(Verb::Source, Iri::parse(iri).unwrap());

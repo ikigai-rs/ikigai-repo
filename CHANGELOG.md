@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.0
+
+- The exec split (ledger #3818): every git facade (`urn:repo:status`, `urn:repo:log`,
+  `urn:repo:show`, `urn:repo:branch`, `urn:repo:{repo}:object:sha:{sha}`) declares and
+  enforces `urn:cap:exec:read:git` instead of `urn:cap:exec:git`, and every `urn:repo:pr:*`
+  facade declares and enforces `urn:cap:exec:read:gh` instead of `urn:cap:exec:gh`. The
+  old spellings are refused with a typed `Denied`. The declared contract changes, so
+  this is a minor bump: grants and hosts that named the old scopes must name the new ones.
+- `urn:cap:exec:write:git` is reserved for a future `Sink` facade. Nothing declares it.
+
 ## 0.5.1
 
 - `urn:repo:log` frames each record with NUL-terminated fields, so an author name containing the

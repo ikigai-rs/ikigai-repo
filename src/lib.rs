@@ -66,10 +66,12 @@
 //!
 //! ## Capabilities
 //! Each facade declares and enforces the concrete capability it needs:
-//! `urn:cap:exec:git` for the git facades, `urn:cap:exec:gh` for the
+//! `urn:cap:exec:read:git` for the git facades, `urn:cap:exec:read:gh` for the
 //! `urn:repo:pr:*` family. Those grants now gate only these facades; holding
-//! `urn:cap:exec:git` does not let a caller choose what git runs. No grant, no
-//! tool.
+//! `urn:cap:exec:read:git` does not let a caller choose what git runs. No grant, no
+//! tool. The pre-0.6.0 spellings `urn:cap:exec:git` and `urn:cap:exec:gh` grant
+//! nothing (ledger #3818). `urn:cap:exec:write:git` is reserved for a future
+//! `Sink` facade; nothing here declares or accepts it.
 //!
 //! `urn:repo:list` is a filesystem read, not an exec — it enumerates directory
 //! names, never spawning a process — so it declares and enforces
@@ -344,7 +346,7 @@ fn prepare_command(
             ALLOWED_TOOLS.join(", ")
         )));
     }
-    let scope = format!("urn:cap:exec:{tool}");
+    let scope = format!("urn:cap:exec:read:{tool}");
     if !inv.capability.allows(&scope) {
         // Typed `Denied` — a permanent authority failure the trace, manifold,
         // and wire recognize as a 403-equivalent without sniffing message text.
@@ -353,7 +355,7 @@ fn prepare_command(
         )));
     }
     let place = dir.map(|dir| confine(roots, dir)).transpose()?;
-    // ambient: process: running git and gh is this connector's job; the tool is one of ALLOWED_TOOLS, the caller holds `urn:cap:exec:{tool}` (checked above), and its directory is confined to the host's roots
+    // ambient: process: running git and gh is this connector's job; the tool is one of ALLOWED_TOOLS, the caller holds `urn:cap:exec:read:{tool}` (checked above), and its directory is confined to the host's roots
     #[allow(clippy::disallowed_methods)]
     let mut command = Command::new(tool);
     // The repository is the one git finds from the directory, never one an
@@ -530,7 +532,7 @@ fn git_facade(
             .summary(summary)
             .verb(Verb::Source)
             .verb(Verb::Meta)
-            .requires("urn:cap:exec:git")
+            .requires("urn:cap:exec:read:git")
             .input(dir_arg(
                 "the repository directory (defaults to the process cwd)",
             ))
@@ -562,7 +564,7 @@ fn gh_pr_facade(
             .summary(summary)
             .verb(Verb::Source)
             .verb(Verb::Meta)
-            .requires("urn:cap:exec:gh")
+            .requires("urn:cap:exec:read:gh")
             .input(
                 ArgSpec::new("pr")
                     .class(XSD_INTEGER)
@@ -726,7 +728,7 @@ fn pr_files(roots: Roots) -> FnEndpoint {
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
-            .requires("urn:cap:exec:gh")
+            .requires("urn:cap:exec:read:gh")
             .input(
                 ArgSpec::new("pr")
                     .class(XSD_INTEGER)
@@ -787,7 +789,7 @@ fn pr_list(roots: Roots) -> FnEndpoint {
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
-            .requires("urn:cap:exec:gh")
+            .requires("urn:cap:exec:read:gh")
             .input(
                 ArgSpec::new("state")
                     .class(XSD_STRING)
@@ -864,7 +866,7 @@ fn log(roots: Roots) -> impl ikigai_core::Endpoint {
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
-            .requires("urn:cap:exec:git")
+            .requires("urn:cap:exec:read:git")
             .input(
                 ArgSpec::new("limit")
                     .class(XSD_INTEGER)
@@ -1042,7 +1044,7 @@ fn object(roots: Roots) -> FnEndpoint {
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
-            .requires("urn:cap:exec:git")
+            .requires("urn:cap:exec:read:git")
             .input(ArgSpec::new("repo").binding().class(XSD_STRING)
                 .summary("the repository directory name, in the resource IRI"))
             .input(ArgSpec::new("sha").binding().class(XSD_STRING)
@@ -1057,9 +1059,9 @@ fn object(roots: Roots) -> FnEndpoint {
 }
 
 fn object_lookup(inv: &Invocation<'_>, roots: &[PathBuf]) -> Result<Representation> {
-    if !inv.capability.allows("urn:cap:exec:git") {
+    if !inv.capability.allows("urn:cap:exec:read:git") {
         return Err(Error::Denied(
-            "exec: capability does not grant `urn:cap:exec:git`".into(),
+            "exec: capability does not grant `urn:cap:exec:read:git`".into(),
         ));
     }
     let sha = inv
@@ -1289,7 +1291,7 @@ fn show(roots: Roots) -> FnEndpoint {
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
-            .requires("urn:cap:exec:git")
+            .requires("urn:cap:exec:read:git")
             .input(
                 ArgSpec::new("rev")
                     .class(XSD_STRING)
@@ -1465,7 +1467,7 @@ pub fn space() -> EndpointSpace {
 /// let outside = root.parent().unwrap().to_str().unwrap().as_bytes().to_vec();
 /// let request = Request::new(Verb::Source, Iri::parse("urn:repo:status").unwrap())
 ///     .with_arg("dir", ArgRef::Inline(outside));
-/// let capability = Capability::scoped(["urn:cap:exec:git"]);
+/// let capability = Capability::scoped(["urn:cap:exec:read:git"]);
 /// let err = futures::executor::block_on(kernel.issue(request, &capability)).unwrap_err();
 /// assert!(matches!(err, Error::Denied(_)), "{err:?}");
 /// std::fs::remove_dir_all(&root).ok();
@@ -1607,7 +1609,13 @@ mod tests {
     fn system_exec_is_not_served() {
         for cap in [
             Capability::root(),
-            Capability::scoped(["urn:cap:exec:git", "urn:cap:exec:gh", "urn:cap:exec:*"]),
+            Capability::scoped([
+                "urn:cap:exec:read:git",
+                "urn:cap:exec:read:gh",
+                "urn:cap:exec:git",
+                "urn:cap:exec:gh",
+                "urn:cap:exec:*",
+            ]),
         ] {
             let err = source(
                 "urn:system:exec",
@@ -1726,7 +1734,7 @@ mod tests {
             &kernel,
             "urn:test:budget",
             &[],
-            &Capability::scoped(["urn:cap:exec:git"]),
+            &Capability::scoped(["urn:cap:exec:read:git"]),
         );
         assert!(
             matches!(result, Err(Error::OverBudget { .. })),
@@ -1740,7 +1748,7 @@ mod tests {
     }
 
     /// The gate every facade rides: `run` refuses a tool off the allowlist and a
-    /// caller without `urn:cap:exec:{tool}`, both before a process is spawned.
+    /// caller without `urn:cap:exec:read:{tool}`, both before a process is spawned.
     /// (Moved from the retired `urn:system:exec` test, which pinned the same two
     /// refusals through that endpoint.)
     #[test]
@@ -1754,9 +1762,21 @@ mod tests {
         assert!(!err.is_transient(), "{err:?}");
 
         // A grant for one tool does not reach another.
-        let gh = Capability::scoped(["urn:cap:exec:gh"]);
+        let gh = Capability::scoped(["urn:cap:exec:read:gh"]);
         let err = run_fixed("git", &["--version"], &gh).unwrap_err();
         assert!(matches!(err, Error::Denied(_)), "{err:?}");
+
+        // The pre-split spelling grants nothing here (ledger #3818): only the
+        // read grant `urn:cap:exec:read:{tool}` reaches a read facade's tool.
+        for tool in ["git", "gh"] {
+            let cap = Capability::scoped([format!("urn:cap:exec:{tool}")]);
+            let err = run_fixed(tool, &["--version"], &cap).unwrap_err();
+            assert!(matches!(err, Error::Denied(_)), "{tool}: {err:?}");
+            assert!(
+                format!("{err:?}").contains(&format!("urn:cap:exec:read:{tool}")),
+                "{tool}: {err:?}"
+            );
+        }
 
         // A non-allowlisted tool → refused before any process, even under a matching cap.
         let other = Capability::scoped(["urn:cap:exec:rm"]);
@@ -1769,7 +1789,7 @@ mod tests {
         // cargo and just have no facade, so they are off the list too (ledger
         // #1712): a `--version` that would succeed is refused under the grant.
         for tool in ["cargo", "just"] {
-            let cap = Capability::scoped([format!("urn:cap:exec:{tool}")]);
+            let cap = Capability::scoped([format!("urn:cap:exec:read:{tool}")]);
             let err = run_fixed(tool, &["--version"], &cap).unwrap_err();
             assert!(
                 format!("{err:?}").contains("not an allowlisted tool"),
@@ -1778,7 +1798,7 @@ mod tests {
         }
 
         // git --version under the git grant → runs, stdout carries "git version".
-        let git = Capability::scoped(["urn:cap:exec:git"]);
+        let git = Capability::scoped(["urn:cap:exec:read:git"]);
         let out = run_fixed("git", &["--version"], &git).unwrap();
         assert!(
             String::from_utf8_lossy(&out.bytes).contains("git version"),
@@ -1840,7 +1860,7 @@ mod tests {
     }
 
     fn git_cap() -> Capability {
-        Capability::scoped(["urn:cap:exec:git"])
+        Capability::scoped(["urn:cap:exec:read:git"])
     }
 
     fn assert_denied(result: Result<Representation>, what: &str) {
@@ -2096,7 +2116,7 @@ mod tests {
         assert!(endpoint
             .describe()
             .requires
-            .contains(&"urn:cap:exec:git".into()));
+            .contains(&"urn:cap:exec:read:git".into()));
         let request = Request::new(Verb::Source, Iri::parse(&iri).unwrap());
         let mut bindings = Bindings::new();
         bindings.insert("repo", "repo");
@@ -2353,7 +2373,7 @@ mod tests {
                 err => panic!("{missing}: {err:?}"),
             }
         }
-        let gh = Capability::scoped(["urn:cap:exec:gh"]);
+        let gh = Capability::scoped(["urn:cap:exec:read:gh"]);
         assert_denied(repo.show_as("HEAD", "vocab/core.ttl", &gh), "no git grant");
 
         let outside = Base::new("show-outside");
@@ -2460,7 +2480,7 @@ mod tests {
                 iri,
             );
         }
-        let gh = Capability::scoped(["urn:cap:exec:gh"]);
+        let gh = Capability::scoped(["urn:cap:exec:read:gh"]);
         for iri in [
             "urn:repo:pr:list",
             "urn:repo:pr:view",
@@ -2681,7 +2701,7 @@ mod tests {
     /// beyond this machine.
     #[test]
     fn pr_repo_must_be_owner_and_name() {
-        let gh = Capability::scoped(["urn:cap:exec:gh"]);
+        let gh = Capability::scoped(["urn:cap:exec:read:gh"]);
         for repo in [
             "127.0.0.1:9/owner/name",
             "localhost/owner/name",
@@ -2764,26 +2784,26 @@ mod tests {
 
     #[test]
     fn gh_facade_is_gated_and_requires_pr() {
-        // No exec:gh grant → denied (typed, permanent) before any gh runs.
-        let bare = Capability::scoped(["urn:cap:exec:git"]);
+        // No exec:read:gh grant → denied (typed, permanent) before any gh runs.
+        let bare = Capability::scoped(["urn:cap:exec:read:git"]);
         let err = source("urn:repo:pr:checks", &[("pr", "1")], &bare).unwrap_err();
         assert!(matches!(err, Error::Denied(_)), "{err:?}");
         assert!(!err.is_transient(), "{err:?}");
 
         // With the grant but no pr= → a clean missing-argument error (still no gh run).
-        let gh = Capability::scoped(["urn:cap:exec:gh"]);
+        let gh = Capability::scoped(["urn:cap:exec:read:gh"]);
         let err = source("urn:repo:pr:checks", &[], &gh).unwrap_err();
         assert!(format!("{err:?}").contains("MissingArgument"), "{err:?}");
     }
 
     #[test]
     fn a_facade_declares_its_capability_and_reads_this_repo() {
-        // The facade requires exec:git; without it, denied.
+        // The facade requires exec:read:git; without it, denied.
         let bare = Capability::scoped(["urn:cap:unrelated"]);
         assert!(source("urn:repo:branch", &[], &bare).is_err());
 
         // With it, `urn:repo:branch` reads the current repo (this crate's dir).
-        let git = Capability::scoped(["urn:cap:exec:git"]);
+        let git = Capability::scoped(["urn:cap:exec:read:git"]);
         let out = source("urn:repo:branch", &[], &git);
         // In CI/checkout this resolves to a branch name (or empty on detached HEAD);
         // either way it must not error under the right capability.
@@ -2930,15 +2950,15 @@ mod tests {
 
     #[test]
     fn pr_list_and_diff_are_gated() {
-        // No exec:gh grant → typed, permanent Denied before any gh runs.
-        let bare = Capability::scoped(["urn:cap:exec:git"]);
+        // No exec:read:gh grant → typed, permanent Denied before any gh runs.
+        let bare = Capability::scoped(["urn:cap:exec:read:git"]);
         let err = source("urn:repo:pr:list", &[], &bare).unwrap_err();
         assert!(matches!(err, Error::Denied(_)), "{err:?}");
         let err = source("urn:repo:pr:diff", &[("pr", "1")], &bare).unwrap_err();
         assert!(matches!(err, Error::Denied(_)), "{err:?}");
 
         // pr:diff without pr= → a clean missing-argument error (still no gh run).
-        let gh = Capability::scoped(["urn:cap:exec:gh"]);
+        let gh = Capability::scoped(["urn:cap:exec:read:gh"]);
         let err = source("urn:repo:pr:diff", &[], &gh).unwrap_err();
         assert!(format!("{err:?}").contains("MissingArgument"), "{err:?}");
 
@@ -2999,9 +3019,12 @@ mod tests {
     fn descriptions_declare_faces_args_and_caps() {
         use ikigai_core::Endpoint;
 
-        // pr:list: exec:gh, limit default 30 (xsd:integer), a json face, both outputs.
+        // pr:list: exec:read:gh, limit default 30 (xsd:integer), a json face, both outputs.
         let d = pr_list(no_roots()).describe();
-        assert!(d.requires.contains(&"urn:cap:exec:gh".to_string()), "{d:?}");
+        assert!(
+            d.requires.contains(&"urn:cap:exec:read:gh".to_string()),
+            "{d:?}"
+        );
         let limit = d.inputs.iter().find(|a| a.name == "limit").unwrap();
         assert_eq!(limit.default.as_deref(), Some("30"));
         assert!(!limit.required);
@@ -3044,10 +3067,10 @@ mod tests {
         assert_eq!(d.outputs, vec!["text/plain;charset=utf-8".to_string()]);
         assert!(d.inputs.iter().find(|a| a.name == "pr").unwrap().required);
 
-        // log: exec:git, limit default 20, both faces, path= optional.
+        // log: exec:read:git, limit default 20, both faces, path= optional.
         let d = log(no_roots()).describe();
         assert!(
-            d.requires.contains(&"urn:cap:exec:git".to_string()),
+            d.requires.contains(&"urn:cap:exec:read:git".to_string()),
             "{d:?}"
         );
         let limit = d.inputs.iter().find(|a| a.name == "limit").unwrap();
@@ -3056,9 +3079,12 @@ mod tests {
         let path = d.inputs.iter().find(|a| a.name == "path").unwrap();
         assert!(!path.required, "{path:?}");
 
-        // pr:files: exec:gh, pr= required (xsd:integer), a json face, both outputs.
+        // pr:files: exec:read:gh, pr= required (xsd:integer), a json face, both outputs.
         let d = pr_files(no_roots()).describe();
-        assert!(d.requires.contains(&"urn:cap:exec:gh".to_string()), "{d:?}");
+        assert!(
+            d.requires.contains(&"urn:cap:exec:read:gh".to_string()),
+            "{d:?}"
+        );
         let pr = d.inputs.iter().find(|a| a.name == "pr").unwrap();
         assert!(pr.required, "{pr:?}");
         assert_eq!(
@@ -3128,7 +3154,7 @@ mod tests {
             git_in(&["commit", "-q", "--allow-empty", "-m", subject]);
         }
         let dir = base.to_str().unwrap();
-        let git = Capability::scoped(["urn:cap:exec:git"]);
+        let git = Capability::scoped(["urn:cap:exec:read:git"]);
 
         // Default face: oneline, limit honored.
         let out = source_under(
@@ -3207,7 +3233,7 @@ mod tests {
             git_in(&["commit", "-q", "-m", subject]);
         }
         let dir = base.to_str().unwrap();
-        let git = Capability::scoped(["urn:cap:exec:git"]);
+        let git = Capability::scoped(["urn:cap:exec:read:git"]);
 
         // path= narrows the text face to the commits that touched the subtree.
         let out = source_under(
@@ -3301,14 +3327,14 @@ mod tests {
 
     #[test]
     fn pr_files_is_gated_and_guards_pr() {
-        // No exec:gh grant → typed, permanent Denied before any gh runs.
-        let bare = Capability::scoped(["urn:cap:exec:git"]);
+        // No exec:read:gh grant → typed, permanent Denied before any gh runs.
+        let bare = Capability::scoped(["urn:cap:exec:read:git"]);
         let err = source("urn:repo:pr:files", &[("pr", "1")], &bare).unwrap_err();
         assert!(matches!(err, Error::Denied(_)), "{err:?}");
         assert!(!err.is_transient(), "{err:?}");
 
         // With the grant but no pr= → a clean missing-argument error.
-        let gh = Capability::scoped(["urn:cap:exec:gh"]);
+        let gh = Capability::scoped(["urn:cap:exec:read:gh"]);
         let err = source("urn:repo:pr:files", &[], &gh).unwrap_err();
         assert!(format!("{err:?}").contains("MissingArgument"), "{err:?}");
 
