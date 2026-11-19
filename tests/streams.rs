@@ -172,7 +172,7 @@ printf 'diff --git a/file b/file\n+hello \377\n'
     }
     let space = Arc::new(ikigai_repo::space());
     let kernel = Kernel::new(space.clone());
-    let cap = Capability::scoped(["urn:cap:exec:gh"]);
+    let cap = Capability::scoped(["urn:cap:exec:read:gh"]);
     let request = Request::new(Verb::Source, Iri::parse("urn:repo:pr:diff").unwrap())
         .with_arg("pr", ArgRef::Inline(b"42".to_vec()))
         .with_arg("repo", ArgRef::Inline(b"owner/name".to_vec()));

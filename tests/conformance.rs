@@ -287,7 +287,7 @@ fn github_facades_are_denied_under_no_grants() {
 /// The REQUIRED half the opt-out blinds: each PR facade that declares `pr`
 /// required refuses its absence with a typed `MissingArgument`, as REQUIRED
 /// (ikigai-conformance 0.8.0) would hold it to. The caller is granted
-/// `urn:cap:exec:gh`, so the kernel's gate passes and the endpoint's own parse
+/// `urn:cap:exec:read:gh`, so the kernel's gate passes and the endpoint's own parse
 /// is what answers. `dir=` names a directory that does not exist, so even a
 /// facade that stopped parsing `pr` first could not spawn `gh`: the directory
 /// is refused before a spawn and the call reaches nothing.
@@ -295,7 +295,7 @@ fn github_facades_are_denied_under_no_grants() {
 fn pr_facades_refuse_a_missing_pr_typed() {
     let scratch = Scratch::new();
     let kernel = kernel(&scratch);
-    let gh = Capability::scoped(vec!["urn:cap:exec:gh".to_string()]);
+    let gh = Capability::scoped(vec!["urn:cap:exec:read:gh".to_string()]);
     let nowhere = std::env::temp_dir().join(format!(
         "ikigai-repo-conformance-absent-{}",
         std::process::id()
@@ -386,6 +386,101 @@ fn declared_outputs_are_the_media_types_served() {
                 served.contains(face),
                 "{iri} declares `{face}` but no call above served it"
             );
+        }
+    }
+}
+
+/// The exec split (ledger #3818): every facade runs under exactly the narrow
+/// read grant for its tool, `urn:cap:exec:read:git` or `urn:cap:exec:read:gh`,
+/// and is refused with a typed, permanent `Denied` under the old spelling
+/// (`urn:cap:exec:git`, `urn:cap:exec:gh`) and under the other tool's read
+/// grant. Each declares that one grant and nothing under `urn:cap:exec:write:*`.
+///
+/// The git facades answer from the scratch repository. The GitHub facades
+/// cannot reach api.github.com here, so each is given an input its own parse
+/// refuses (`pr=--web`, `state=bogus`): that refusal, not `Denied`, under the
+/// narrow grant shows the capability gate passed, and no `gh` is spawned.
+#[test]
+fn facades_run_under_the_narrow_read_grant_and_refuse_the_old_spelling() {
+    let scratch = Scratch::new();
+    let kernel = kernel(&scratch);
+    let read_git = Capability::scoped(["urn:cap:exec:read:git"]);
+    let read_gh = Capability::scoped(["urn:cap:exec:read:gh"]);
+    let old_git = Capability::scoped(["urn:cap:exec:git"]);
+    let old_gh = Capability::scoped(["urn:cap:exec:gh"]);
+
+    let sha = Command::new("git")
+        .args([
+            "-C",
+            scratch.dir(),
+            "rev-parse",
+            &format!("HEAD:{SHOW_FILE}"),
+        ])
+        .output()
+        .unwrap();
+    assert!(sha.status.success());
+    let object = format!(
+        "urn:repo:scratch:object:sha:{}",
+        String::from_utf8(sha.stdout).unwrap().trim()
+    );
+    let dir = scratch.dir();
+    let git_calls: [(&str, Vec<(&str, &str)>); 5] = [
+        ("urn:repo:status", vec![("dir", dir)]),
+        ("urn:repo:log", vec![("dir", dir)]),
+        ("urn:repo:branch", vec![("dir", dir)]),
+        (
+            "urn:repo:show",
+            vec![("dir", dir), ("rev", "HEAD"), ("path", SHOW_FILE)],
+        ),
+        (object.as_str(), vec![("dir", dir)]),
+    ];
+    for (iri, args) in &git_calls {
+        let description = kernel
+            .describe_pattern(iri)
+            .unwrap_or_else(|| panic!("{iri} describes itself"));
+        assert_eq!(
+            description.requires,
+            vec!["urn:cap:exec:read:git".to_string()],
+            "{iri}"
+        );
+        issue(&kernel, iri, args, &read_git)
+            .unwrap_or_else(|err| panic!("{iri} under urn:cap:exec:read:git: {err:?}"));
+        for (spelling, cap) in [("old git", &old_git), ("read gh", &read_gh)] {
+            let err = issue(&kernel, iri, args, cap)
+                .err()
+                .unwrap_or_else(|| panic!("{iri} answered under the {spelling} grant"));
+            assert!(matches!(err, Error::Denied(_)), "{iri} {spelling}: {err:?}");
+            assert!(!err.is_transient(), "{iri} {spelling}: {err:?}");
+        }
+    }
+
+    for (id, iri) in GH_FACADES {
+        let description = kernel
+            .describe_pattern(iri)
+            .unwrap_or_else(|| panic!("{iri} describes itself"));
+        assert_eq!(
+            description.requires,
+            vec!["urn:cap:exec:read:gh".to_string()],
+            "{id}"
+        );
+        let args: &[(&str, &str)] = if id == "repo-pr-list" {
+            &[("state", "bogus")]
+        } else {
+            &[("pr", "--web")]
+        };
+        let err = issue(&kernel, iri, args, &read_gh)
+            .err()
+            .unwrap_or_else(|| panic!("{id} accepted a bad input"));
+        assert!(
+            !matches!(err, Error::Denied(_)) && format!("{err:?}").contains("must be"),
+            "{id} under urn:cap:exec:read:gh: {err:?}"
+        );
+        for (spelling, cap) in [("old gh", &old_gh), ("read git", &read_git)] {
+            let err = issue(&kernel, iri, args, cap)
+                .err()
+                .unwrap_or_else(|| panic!("{id} answered under the {spelling} grant"));
+            assert!(matches!(err, Error::Denied(_)), "{id} {spelling}: {err:?}");
+            assert!(!err.is_transient(), "{id} {spelling}: {err:?}");
         }
     }
 }

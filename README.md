@@ -13,7 +13,7 @@ argv. There is **no low-level exec endpoint** (see [Changes](#changes)):
 | `urn:repo:status` | the working tree's status (`git status --porcelain=v1 -b`) |
 | `urn:repo:log` | recent history (`git log --oneline`, `limit=` commits, default 20); `path=` is a repository-root-relative pathspec that restricts to commits touching a file/subtree (`git log -- <path>`) — under squash-merge style, the merged-PR-per-path index; `as=application/json` → `[{hash, author, date, subject}]` (full sha, RFC 3339 date) |
 | `urn:repo:show` | one file's bytes at a commit (`git cat-file`): `rev=` (a commit hash, branch or tag) and `path=` (relative to the repository root, taken literally) are required; answers `application/octet-stream`, or typed `NotFound` when `rev=` names no commit or `path=` is not a file at that commit |
-| `urn:repo:{repo}:object:sha:{sha}` | a locally held Git object by full SHA (40 or 64 hexadecimal digits): its `sha`, `type` (`commit`, `tree`, `blob`, `tag`), and for a blob its first commit and path; text by default, `as=application/json` for the structured face; requires `urn:cap:exec:git` |
+| `urn:repo:{repo}:object:sha:{sha}` | a locally held Git object by full SHA (40 or 64 hexadecimal digits): its `sha`, `type` (`commit`, `tree`, `blob`, `tag`), and for a blob its first commit and path; text by default, `as=application/json` for the structured face; requires `urn:cap:exec:read:git` |
 | `urn:repo:branch` | the current branch |
 | `urn:repo:list` | enumerate the git repos under a ROOT (for example, `root=~/repos`; omit `root=` to use `$IKIGAI_REPO_ROOT` or the built-in default) as `name`⇥`path`; a filesystem read, gated on `urn:cap:fs:read:*`; explicit `root=` must resolve under a host-configured repository root (no exec cap) |
 | `urn:repo:pr:list` | the PRs, most recently updated first (`gh pr list`), one per line as `number`⇥`title`⇥`state`⇥`branch`⇥`updated` (RFC 3339); `state=` (open/closed/merged/all, default open); `as=application/json` for the structured face; `limit=` (default 30) |
@@ -29,12 +29,17 @@ from the repository root even when `dir=` names a subdirectory, preserving paths
 magic such as `:(glob)` and exclusions.
 
 The `pr:*` facades take `pr=` (the number) plus optional `repo=` (`owner/name`)
-or `dir=` (a repo directory to run in); they require `urn:cap:exec:gh`.
+or `dir=` (a repo directory to run in); they require `urn:cap:exec:read:gh`.
 
 Each facade declares and enforces the concrete capability it needs:
-`urn:cap:exec:git` for `status`/`log`/`show`/`branch`/`object`, `urn:cap:exec:gh` for the
+`urn:cap:exec:read:git` for `status`/`log`/`show`/`branch`/`object`, `urn:cap:exec:read:gh` for the
 `pr:*` family. Those grants gate only these facades: holding
-`urn:cap:exec:git` does not let a caller choose what git runs.
+`urn:cap:exec:read:git` does not let a caller choose what git runs. The old
+spellings `urn:cap:exec:git` and `urn:cap:exec:gh` grant nothing here since 0.6.0.
+
+Every facade reads, so each requires a `read` grant. `urn:cap:exec:write:git` is
+reserved for a future `Sink` facade that changes a repository; nothing declares
+or accepts it today.
 
 The object resource uses the repository directory's name for `{repo}`. For example,
 `urn:repo:ikigai-repo:object:sha:<full-sha>` with `dir=/served/ikigai-repo`
@@ -100,7 +105,7 @@ can't. It is to the shell what `ikigai-personal` is to EventKit.
 use ikigai_core::Kernel;
 use std::sync::Arc;
 let kernel = Kernel::new(Arc::new(ikigai_repo::space()));
-// source urn:repo:status dir=/path/to/repo   (under a urn:cap:exec:git grant)
+// source urn:repo:status dir=/path/to/repo   (under a urn:cap:exec:read:git grant)
 ```
 
 Run `cargo run --example repo-demo` to watch it read its own git state.
@@ -123,6 +128,13 @@ The `urn:repo:pr:*` facades are opted out of the checks that fire them
 capability gate is pinned by a test of its own.
 
 ## Changes
+
+**0.6.0:** the exec split (ledger #3818). The git facades (`status`, `log`, `show`,
+`branch`, `object`) require `urn:cap:exec:read:git` instead of `urn:cap:exec:git`, and
+the `pr:*` facades require `urn:cap:exec:read:gh` instead of `urn:cap:exec:gh`. A
+capability that holds only the old spelling is refused with a typed `Denied`. Hosts
+and grants that named the old scopes need the new ones at their next bump of this crate.
+`urn:cap:exec:write:git` is reserved for a future `Sink` facade; nothing declares it.
 
 **0.3.0:** `urn:system:exec` is no longer served
 (ledger #1706). It took a caller's argument vector (`tool=` + `args=` + `dir=`)
