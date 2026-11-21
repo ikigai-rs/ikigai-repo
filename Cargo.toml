@@ -1,7 +1,7 @@
 [package]
 name = "ikigai-repo"
 description = "Git and gh as ikigai resources: typed, capability-gated repo facades (urn:repo:*)."
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -20,7 +20,11 @@ repository = "https://github.com/ikigai-rs/ikigai-repo"
 # whoever delivered it, and ContentStore::put/put_replay are root-only. This
 # crate calls neither, but under 0.x a caret is a ceiling and core's types are
 # in this crate's API, so this is a deliberate re-pin and a minor bump to 0.4.0.
-ikigai-core = "0.3.0"
+# 0.4.0 is core 0.4.0 (scope opacity, structured denials; the cascade, epic
+# #3893): `Error::Denied` carries a `Denial`, and an invocation's scope is
+# opaque. Core's types are in this crate's API, so this is a deliberate re-pin
+# and a minor bump to 0.7.0.
+ikigai-core = "0.4.0"
 async-trait = "0.1"
 futures = "0.3"
 
@@ -28,5 +32,5 @@ futures = "0.3"
 # The module recipe as one test (`tests/conformance.rs`). 0.12 added BODIES
 # and BODY-INPUTS by default; 0.14 is the release on core 0.3.0. Under 0.x a
 # caret is also a ceiling: "0.14.0" means >=0.14.0, <0.15.0, so a later minor
-# needs a deliberate re-pin.
-ikigai-conformance = "0.14.0"
+# needs a deliberate re-pin. 0.15 is the release on core 0.4.0 (the cascade).
+ikigai-conformance = "0.15.0"

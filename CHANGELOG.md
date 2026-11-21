@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.0
+
+- Re-pin to ikigai-core 0.4.0 (scope opacity, structured denials; the core 0.4.0 cascade,
+  epic #3893). `Error::Denied` now carries core's `Denial`, so this crate's refusals are built
+  from the same messages as before; their text does not change. Core's types are in this
+  crate's API, so a consumer on core 0.3 cannot mix them with this release: a minor bump.
+- Tests run on ikigai-conformance 0.15.0, its release on core 0.4.0.
+
 ## 0.6.0
 
 - The exec split (ledger #3818): every git facade (`urn:repo:status`, `urn:repo:log`,
