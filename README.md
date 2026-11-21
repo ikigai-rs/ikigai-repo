@@ -129,6 +129,10 @@ capability gate is pinned by a test of its own.
 
 ## Changes
 
+**0.7.0:** re-pinned to ikigai-core 0.4.0 (the core 0.4.0 cascade). Refusals are
+core's structured `Denial`, with the same messages as before. A host on core 0.3
+stays on 0.6.
+
 **0.6.0:** the exec split (ledger #3818). The git facades (`status`, `log`, `show`,
 `branch`, `object`) require `urn:cap:exec:read:git` instead of `urn:cap:exec:git`, and
 the `pr:*` facades require `urn:cap:exec:read:gh` instead of `urn:cap:exec:gh`. A

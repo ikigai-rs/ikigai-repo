@@ -200,16 +200,19 @@ fn confine(roots: &[PathBuf], dir: &str) -> Result<Place> {
 /// Apply the same canonical path boundary to a directory or an explicit list root.
 fn confine_path(roots: &[PathBuf], arg: &str, dir: &str) -> Result<Place> {
     if roots.is_empty() {
-        return Err(Error::Denied(format!(
-            "{arg}=`{dir}` refused: this space has no repository roots configured, so it runs \
-             in no caller-named directory; a host passes the directories it serves with \
-             ikigai_repo::space_with_roots(..)"
-        )));
+        return Err(Error::Denied(
+            format!(
+                "{arg}=`{dir}` refused: this space has no repository roots configured, so it runs \
+                 in no caller-named directory; a host passes the directories it serves with \
+                 ikigai_repo::space_with_roots(..)"
+            )
+            .into(),
+        ));
     }
     let refused = || {
-        Error::Denied(format!(
-            "{arg}=`{dir}` is not a directory under a configured repository root"
-        ))
+        Error::Denied(
+            format!("{arg}=`{dir}` is not a directory under a configured repository root").into(),
+        )
     };
     // ambient: fs: resolves the caller's directory (links, `..`) to compare with host-configured roots; reached only after the facade's exec grant or the list endpoint's filesystem read grant check
     #[allow(clippy::disallowed_methods)]
@@ -350,9 +353,9 @@ fn prepare_command(
     if !inv.capability.allows(&scope) {
         // Typed `Denied` — a permanent authority failure the trace, manifold,
         // and wire recognize as a 403-equivalent without sniffing message text.
-        return Err(Error::Denied(format!(
-            "exec: capability does not grant `{scope}`"
-        )));
+        return Err(Error::Denied(
+            format!("exec: capability does not grant `{scope}`").into(),
+        ));
     }
     let place = dir.map(|dir| confine(roots, dir)).transpose()?;
     // ambient: process: running git and gh is this connector's job; the tool is one of ALLOWED_TOOLS, the caller holds `urn:cap:exec:read:{tool}` (checked above), and its directory is confined to the host's roots
@@ -1366,9 +1369,9 @@ fn list(roots: Roots) -> FnEndpoint {
         if !inv.capability.allows(FS_READ) {
             // Typed `Denied` — a permanent authority failure the trace, manifold,
             // and wire recognize as a 403-equivalent without sniffing message text.
-            return Err(Error::Denied(format!(
-                "repo-list: capability does not grant `{FS_READ}`"
-            )));
+            return Err(Error::Denied(
+                format!("repo-list: capability does not grant `{FS_READ}`").into(),
+            ));
         }
         let root = if let Ok(root) = inv.inline_str("root") {
             confine_path(&roots, "root", root)?.dir
