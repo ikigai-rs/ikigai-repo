@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.1
+
+- Git reads no longer start programs a repository's own configuration names (ledger #3990).
+  Every git run, and every git gh runs, now sets `core.fsmonitor=false` and
+  `core.hooksPath=/dev/null` in the command scope (after any `GIT_CONFIG_COUNT` entries the
+  host passes), beside `safe.bareRepository=explicit`. Before this, `urn:repo:status` ran a
+  repository's `core.fsmonitor`, and on a stat-dirty index fired its `post-index-change`
+  hook, in submodules too. Every facade is a read; there is no write facade, so no hook that
+  should run is turned off. A filter driver chosen by `.gitattributes` still runs when status
+  rehashes a stat-dirty file: the repository names it, so no fixed key turns it off.
+
 ## 0.7.0
 
 - Re-pin to ikigai-core 0.4.0 (scope opacity, structured denials; the core 0.4.0 cascade,
