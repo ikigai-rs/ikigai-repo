@@ -87,7 +87,14 @@ Repository content cannot choose the repository. Every git and gh run sets
 passes), so a bare repository spelled by tracked files inside a served one is
 refused: such a directory could carry its own `core.fsmonitor` command, or a
 `commondir` naming a repository outside every root. With git 2.43 this also
-refuses a `dir=` inside a repository's `.git` directory. The children never
+refuses a `dir=` inside a repository's `.git` directory. A repository's own
+`.git/config` can also name programs a read starts, so every run also sets
+`core.fsmonitor=false` and `core.hooksPath=/dev/null` in the same scope: `git status`
+starts no fsmonitor and fires no `post-index-change` hook, in the repository or its
+submodules. Every facade is a read, so all of them get these keys. Not covered: a
+filter driver (`filter.<driver>.clean` or `.process`, chosen by `.gitattributes`)
+still runs when `git status` rehashes a stat-dirty file, because the repository
+names the driver and git-lfs repositories need it. The children never
 inherit `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_INDEX_FILE`,
 `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES` or `GIT_NAMESPACE`,
 and git never receives `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN` or

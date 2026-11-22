@@ -57,17 +57,29 @@ fn the_host_environment_neither_redirects_nor_leaks() {
     repo(&inside, "inside-subject");
     repo(&outside, "outside-subject");
     let marker = base.join("token-seen-by-git");
+    // A clean filter is a program a repository's own configuration names and
+    // `git status` still starts (core.fsmonitor and hooks are turned off,
+    // ledger #3990): it runs when status rehashes a stat-dirty file.
     git(
         &inside,
         &[
             "config",
-            "core.fsmonitor",
-            &format!(
-                "echo \"${{GH_TOKEN:-unset}}\" > {}; false",
-                marker.display()
-            ),
+            "filter.probe.clean",
+            &format!("echo \"${{GH_TOKEN:-unset}}\" > {}; cat", marker.display()),
         ],
     );
+    std::fs::write(inside.join(".gitattributes"), "probe.txt filter=probe\n").unwrap();
+    std::fs::write(inside.join("probe.txt"), "probe\n").unwrap();
+    git(&inside, &["add", "."]);
+    git(&inside, &["commit", "-q", "-m", "probe"]);
+    std::fs::remove_file(&marker).unwrap();
+    // Same content, another mtime: the index entry is stat-dirty.
+    std::fs::File::options()
+        .write(true)
+        .open(inside.join("probe.txt"))
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000))
+        .unwrap();
     let gh_config = base.join("gh-config");
     std::fs::create_dir_all(&gh_config).unwrap();
 
@@ -94,9 +106,9 @@ fn the_host_environment_neither_redirects_nor_leaks() {
     }
 
     // A git read needs no GitHub token, so code a repository's configuration
-    // runs (here a trusted repository's own core.fsmonitor) is not handed one.
+    // runs (here a trusted repository's own clean filter) is not handed one.
     issue(&kernel, "urn:repo:status", &[("dir", dir)], &all, false).unwrap();
-    let seen = std::fs::read_to_string(&marker).expect("core.fsmonitor ran");
+    let seen = std::fs::read_to_string(&marker).expect("the clean filter ran");
     assert_eq!(seen.trim(), "unset", "git's children saw GH_TOKEN");
 
     // repo= must not choose where gh connects, nor which token it sends there.
