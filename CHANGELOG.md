@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.2
+
+- Optional arguments now refuse invalid values instead of silently selecting defaults; callers
+  sending unreadable values must correct them. Requires ikigai-core 0.4.3. No persisted state changes.
+
 ## 0.7.1
 
 - Git reads no longer start programs a repository's own configuration names (ledger #3990).
