@@ -39,8 +39,7 @@ impl Endpoint for StreamingEndpoint {
             }
             _ => return self.inner.invoke_body(inv).await,
         };
-        let mut command =
-            prepare_command(inv, tool, &args, inv.inline_str("dir").ok(), &self.roots)?;
+        let mut command = prepare_command(inv, tool, &args, inv.optional_str("dir")?, &self.roots)?;
         let limit = inv
             .memory_budget()
             .map_or(ikigai_core::DEFAULT_STREAM_MEMORY, |b| b.remaining());

@@ -442,21 +442,17 @@ fn json(body: String) -> Representation {
 
 /// The `as=` face convention (see ikigai-org / ikigai-personal): a face is
 /// selected by substring, so `as=application/json` and `as=json` both work.
-fn wants_json(inv: &Invocation<'_>) -> bool {
-    inv.inline_str("as")
-        .map(|s| s.contains("json"))
-        .unwrap_or(false)
+fn wants_json(inv: &Invocation<'_>) -> Result<bool> {
+    Ok(inv.optional_str("as")?.is_some_and(|s| s.contains("json")))
 }
 
-/// Parse a `limit=` argument as a count. Arguments are passed as an argv (no
-/// shell), so this is not an injection guard — it stops a stray value from
-/// becoming a *flag* (`-{limit}` with a leading dash) and gives a clean error.
+/// Parse an optional count without treating an invalid value as absence.
 fn parse_limit(inv: &Invocation<'_>, default: u32) -> Result<u32> {
-    match inv.inline_str("limit") {
-        Ok(s) => s
+    match inv.optional_str("limit")? {
+        Some(s) => s
             .parse()
-            .map_err(|_| Error::Endpoint(format!("limit must be a number, got `{s}`"))),
-        Err(_) => Ok(default),
+            .map_err(|_| invalid("limit", format!("must be a number, got {}", quoted(s)))),
+        None => Ok(default),
     }
 }
 
@@ -479,16 +475,16 @@ fn parse_pr(inv: &Invocation<'_>) -> Result<u64> {
 /// part is a GitHub-style name: letters, digits, `-`, `_` and `.`, not starting
 /// with `-` and not `.` or `..`.
 fn parse_repo<'a>(inv: &'a Invocation<'_>) -> Result<Option<&'a str>> {
-    match inv.inline_str("repo") {
-        Ok(repo) if pr_repo_is_owner_and_name(repo) => Ok(Some(repo)),
-        Ok(repo) => Err(invalid(
+    match inv.optional_str("repo")? {
+        Some(repo) if pr_repo_is_owner_and_name(repo) => Ok(Some(repo)),
+        Some(repo) => Err(invalid(
             "repo",
             format!(
                 "{} is not owner/name: give an owner and a repository name",
                 quoted(repo)
             ),
         )),
-        Err(_) => Ok(None),
+        None => Ok(None),
     }
 }
 
@@ -511,13 +507,14 @@ fn pr_repo_is_owner_and_name(repo: &str) -> bool {
 /// instead of quietly matching nothing, and to stop the empty string (git
 /// rejects the empty pathspec with its own fatal).
 fn parse_path(inv: &Invocation<'_>) -> Result<Option<String>> {
-    match inv.inline_str("path") {
-        Ok("") => Err(Error::Endpoint("path must not be empty".to_string())),
-        Ok(s) if s.starts_with('-') => Err(Error::Endpoint(format!(
-            "path must be a pathspec, not a flag: got `{s}`"
-        ))),
-        Ok(s) => Ok(Some(s.to_string())),
-        Err(_) => Ok(None),
+    match inv.optional_str("path")? {
+        Some("") => Err(invalid("path", "must not be empty".to_string())),
+        Some(s) if s.starts_with('-') => Err(invalid(
+            "path",
+            format!("must be a pathspec, not a flag: got {}", quoted(s)),
+        )),
+        Some(s) => Ok(Some(s.to_string())),
+        None => Ok(None),
     }
 }
 
@@ -562,7 +559,7 @@ fn git_facade(
 ) -> FnEndpoint {
     FnEndpoint::new(id, move |inv: &Invocation<'_>| {
         let args: Vec<String> = git_args.iter().map(|a| a.to_string()).collect();
-        let dir = inv.inline_str("dir").ok();
+        let dir = inv.optional_str("dir")?;
         run(inv, "git", &args, dir, &roots).map(text)
     })
     .with_description(
@@ -594,7 +591,7 @@ fn gh_pr_facade(
     let body_roots = roots.clone();
     let endpoint = FnEndpoint::new(id, move |inv: &Invocation<'_>| {
         let (args, want_json) = gh_pr_args(inv, sub, json_fields)?;
-        let dir = inv.inline_str("dir").ok();
+        let dir = inv.optional_str("dir")?;
         run(inv, "gh", &args, dir, &roots).map(if want_json { json } else { text })
     })
     .with_description({
@@ -652,7 +649,7 @@ fn gh_pr_args(
     let pr = parse_pr(inv)?;
     let mut args: Vec<String> = sub.iter().map(|a| a.to_string()).collect();
     args.push(pr.to_string());
-    let want_json = json_fields.is_some() && wants_json(inv);
+    let want_json = wants_json(inv)? && json_fields.is_some();
     if let (Some(fields), true) = (json_fields, want_json) {
         args.push("--json".to_string());
         args.push(fields.to_string());
@@ -750,10 +747,10 @@ fn pr_files_args(pr: u64, want_json: bool, repo: Option<&str>) -> Vec<String> {
 fn pr_files(roots: Roots) -> FnEndpoint {
     FnEndpoint::new("repo-pr-files", move |inv: &Invocation<'_>| {
         let pr = parse_pr(inv)?;
-        let want_json = wants_json(inv);
+        let want_json = wants_json(inv)?;
         let repo = parse_repo(inv)?;
         let args = pr_files_args(pr, want_json, repo);
-        let dir = inv.inline_str("dir").ok();
+        let dir = inv.optional_str("dir")?;
         run(inv, "gh", &args, dir, &roots).map(if want_json { json } else { text })
     })
     .with_description(
@@ -800,20 +797,24 @@ fn pr_files(roots: Roots) -> FnEndpoint {
 /// through.
 fn pr_list(roots: Roots) -> FnEndpoint {
     FnEndpoint::new("repo-pr-list", move |inv: &Invocation<'_>| {
-        let state = inv.inline_str("state").unwrap_or("open");
+        let state = inv.optional_str("state")?.unwrap_or("open");
         if !PR_LIST_STATES.contains(&state) {
             // Refused before gh is spawned — a stray value must never become
             // part of the search invocation.
-            return Err(Error::Endpoint(format!(
-                "state must be one of {}, got `{state}`",
-                PR_LIST_STATES.join(", ")
-            )));
+            return Err(invalid(
+                "state",
+                format!(
+                    "must be one of {}, got {}",
+                    PR_LIST_STATES.join(", "),
+                    quoted(state)
+                ),
+            ));
         }
         let limit = parse_limit(inv, 30)?;
-        let want_json = wants_json(inv);
+        let want_json = wants_json(inv)?;
         let repo = parse_repo(inv)?;
         let args = pr_list_args(state, limit, want_json, repo);
-        let dir = inv.inline_str("dir").ok();
+        let dir = inv.optional_str("dir")?;
         run(inv, "gh", &args, dir, &roots).map(if want_json { json } else { text })
     })
     .with_description(
@@ -878,7 +879,7 @@ fn log(roots: Roots) -> impl ikigai_core::Endpoint {
     let body_roots = roots.clone();
     let endpoint = FnEndpoint::new("repo-log", move |inv: &Invocation<'_>| {
         let (args, want_json) = log_args(inv)?;
-        let raw = run(inv, "git", &args, inv.inline_str("dir").ok(), &roots)?;
+        let raw = run(inv, "git", &args, inv.optional_str("dir")?, &roots)?;
         if want_json {
             let mut entries = Vec::new();
             let mut remaining = raw.as_bytes();
@@ -937,7 +938,7 @@ fn log(roots: Roots) -> impl ikigai_core::Endpoint {
 fn log_args(inv: &Invocation<'_>) -> Result<(Vec<String>, bool)> {
     let limit = parse_limit(inv, 20)?;
     let path = parse_path(inv)?;
-    let want_json = wants_json(inv);
+    let want_json = wants_json(inv)?;
     let mut args: Vec<String> = vec!["log".to_string()];
     if want_json {
         // Four NUL-terminated fields: names can contain the old unit separator,
@@ -1117,11 +1118,12 @@ fn object_lookup(inv: &Invocation<'_>, roots: &[PathBuf]) -> Result<Representati
         ));
     }
     let sha = sha.to_ascii_lowercase();
+    let want_json = wants_json(inv)?;
     let repo = inv
         .bindings
         .get("repo")
         .ok_or_else(|| Error::MissingArgument("repo".into()))?;
-    let dir = inv.inline_str("dir").ok();
+    let dir = inv.optional_str("dir")?;
     let git = |args: &[&str]| {
         let mut fixed = vec!["--no-replace-objects".to_string()];
         fixed.extend(args.iter().map(|a| a.to_string()));
@@ -1214,7 +1216,7 @@ fn object_lookup(inv: &Invocation<'_>, roots: &[PathBuf]) -> Result<Representati
             }
         }
     }
-    let repr = if wants_json(inv) {
+    let repr = if want_json {
         let first = introduction
             .as_ref()
             .map(|(commit, path)| {
@@ -1268,7 +1270,7 @@ fn show(roots: Roots) -> FnEndpoint {
     FnEndpoint::new("repo-show", move |inv: &Invocation<'_>| {
         let rev = parse_rev(inv)?;
         let path = parse_show_path(inv)?;
-        let dir = inv.inline_str("dir").ok();
+        let dir = inv.optional_str("dir")?;
         let git = |args: &[&str]| {
             let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
             run_output(inv, "git", &args, dir, &roots)
@@ -1352,7 +1354,7 @@ fn show(roots: Roots) -> FnEndpoint {
 /// then the `IKIGAI_REPO_ROOT` env var (the IKIGAI_* config convention), then
 /// `~/git-personal` — this ecosystem's home for its sibling repos.
 fn repo_root(inv: &Invocation<'_>) -> Result<PathBuf> {
-    if let Ok(root) = inv.inline_str("root") {
+    if let Some(root) = inv.optional_str("root")? {
         return Ok(PathBuf::from(root));
     }
     if let Ok(root) = std::env::var("IKIGAI_REPO_ROOT") {
@@ -1409,7 +1411,7 @@ fn list(roots: Roots) -> FnEndpoint {
                 format!("repo-list: capability does not grant `{FS_READ}`").into(),
             ));
         }
-        let root = if let Ok(root) = inv.inline_str("root") {
+        let root = if let Some(root) = inv.optional_str("root")? {
             confine_path(&roots, "root", root)?.dir
         } else {
             repo_root(inv)?
@@ -1634,6 +1636,115 @@ mod tests {
             request = request.with_arg(*k, ArgRef::Inline(v.as_bytes().to_vec()));
         }
         block_on(kernel.issue(request, cap))
+    }
+
+    #[test]
+    fn invalid_optional_limit_is_refused() {
+        let request = Request::new(Verb::Source, Iri::parse("urn:test:limit").unwrap())
+            .with_arg("limit", ArgRef::Inline(vec![0xff]));
+        let bindings = ikigai_core::Bindings::new();
+        let cap = Capability::root();
+        let inv = Invocation::detached(&request, &bindings, &cap);
+        assert!(
+            matches!(parse_limit(&inv, 20), Err(Error::InvalidArgument { name, .. }) if name == "limit")
+        );
+    }
+
+    #[test]
+    fn optional_arguments_reject_unreadable_values_at_each_endpoint() {
+        use ikigai_core::{Bindings, ContentId, Endpoint};
+        let roots = no_roots();
+        let cases: Vec<(Box<dyn Endpoint>, &[&str])> = vec![
+            (
+                Box::new(git_facade("status", "", "", &["status"], roots.clone())),
+                &["dir"],
+            ),
+            (
+                Box::new(git_facade("branch", "", "", &["branch"], roots.clone())),
+                &["dir"],
+            ),
+            (
+                Box::new(log(roots.clone())),
+                &["dir", "as", "limit", "path"],
+            ),
+            (Box::new(show(roots.clone())), &["dir"]),
+            (Box::new(object(roots.clone())), &["dir", "as"]),
+            (Box::new(list(roots.clone())), &["root"]),
+            (
+                Box::new(pr_list(roots.clone())),
+                &["dir", "as", "limit", "state", "repo"],
+            ),
+            (Box::new(pr_files(roots.clone())), &["dir", "as", "repo"]),
+            (
+                Box::new(gh_pr_facade(
+                    "repo-pr-view",
+                    "",
+                    "",
+                    &["pr", "view"],
+                    Some("number"),
+                    roots.clone(),
+                )),
+                &["dir", "as", "repo"],
+            ),
+            (
+                Box::new(gh_pr_facade(
+                    "repo-pr-checks",
+                    "",
+                    "",
+                    &["pr", "checks"],
+                    None,
+                    roots.clone(),
+                )),
+                &["dir", "repo"],
+            ),
+            (
+                Box::new(gh_pr_facade(
+                    "repo-pr-diff",
+                    "",
+                    "",
+                    &["pr", "diff"],
+                    None,
+                    roots,
+                )),
+                &["dir", "repo"],
+            ),
+        ];
+        let cap = Capability::root();
+        let mut bindings = Bindings::new();
+        bindings.insert("repo", "repo");
+        bindings.insert("sha", "0000000000000000000000000000000000000000");
+        for (endpoint, names) in cases {
+            for &name in names {
+                for value in [
+                    ArgRef::Inline(vec![0xff]),
+                    ArgRef::Reference(Iri::parse("urn:test:value").unwrap()),
+                    ArgRef::Content(ContentId::of(b"value")),
+                ] {
+                    let request =
+                        Request::new(Verb::Source, Iri::parse("urn:test:endpoint").unwrap())
+                            .with_arg("pr", ArgRef::Inline(b"1".to_vec()))
+                            .with_arg("rev", ArgRef::Inline(b"HEAD".to_vec()))
+                            .with_arg("path", ArgRef::Inline(b"file".to_vec()))
+                            .with_arg(name, value);
+                    let inv = Invocation::detached(&request, &bindings, &cap);
+                    let err = block_on(endpoint.invoke(&inv)).unwrap_err();
+                    assert!(
+                        matches!(&err, Error::InvalidArgument { name: n, detail } if n == name && !detail.is_empty()),
+                        "{} {name}: {err:?}",
+                        endpoint.name()
+                    );
+                    if matches!(endpoint.name(), "repo-log" | "repo-pr-diff") {
+                        let err = block_on(endpoint.invoke_body(&inv))
+                            .expect_err("stream must refuse invalid argument");
+                        assert!(
+                            matches!(&err, Error::InvalidArgument { name: n, .. } if n == name),
+                            "{} stream {name}: {err:?}",
+                            endpoint.name()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn no_roots() -> Roots {
@@ -3142,7 +3253,7 @@ mod tests {
         // must never become a flag (`-{limit}`).
         let err = source("urn:repo:pr:list", &[("limit", "nope")], &gh).unwrap_err();
         assert!(
-            format!("{err:?}").contains("limit must be a number"),
+            matches!(&err, Error::InvalidArgument { name, detail } if name == "limit" && detail.contains("must be a number")),
             "{err:?}"
         );
 
@@ -3150,7 +3261,7 @@ mod tests {
         // spawned, and the error names the valid values.
         let err = source("urn:repo:pr:list", &[("state", "draft")], &gh).unwrap_err();
         assert!(
-            format!("{err:?}").contains("state must be one of open, closed, merged, all"),
+            matches!(&err, Error::InvalidArgument { name, detail } if name == "state" && detail.contains("must be one of open, closed, merged, all")),
             "{err:?}"
         );
     }
@@ -3373,7 +3484,7 @@ mod tests {
         // A non-numeric limit is refused before git runs.
         let err = source_under(&[&base], "urn:repo:log", &[("limit", "1; rm")], &git).unwrap_err();
         assert!(
-            format!("{err:?}").contains("limit must be a number"),
+            matches!(&err, Error::InvalidArgument { name, detail } if name == "limit" && detail.contains("must be a number")),
             "{err:?}"
         );
 
@@ -3460,7 +3571,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            format!("{err:?}").contains("path must be a pathspec"),
+            matches!(&err, Error::InvalidArgument { name, detail } if name == "path" && detail.contains("must be a pathspec")),
             "{err:?}"
         );
         // The empty pathspec is refused with our error, not git's fatal.
@@ -3472,7 +3583,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            format!("{err:?}").contains("path must not be empty"),
+            matches!(&err, Error::InvalidArgument { name, detail } if name == "path" && detail.contains("must not be empty")),
             "{err:?}"
         );
 
